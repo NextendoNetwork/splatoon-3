@@ -1,0 +1,19 @@
+# Build outputs / compiled servers
+*.exe
+*.linux
+*.out
+/bin/
+/dist/
+# Raw / measured binary data — never ship these
+*.bin
+measured/
+# Secrets & local config — NEVER commit
+.env
+*.pem
+*.key
+*.pfx
+
+# Reponses mesurees — fournies par l'operateur, jamais versionnees (voir captures.go)
+captured/
+captured_boot/
+*.grpc
