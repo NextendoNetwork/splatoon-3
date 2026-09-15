@@ -1182,6 +1182,16 @@ func (g *gameSessionServer) GetGameSessionShortAlias(ctx context.Context, req *m
 	}, nil
 }
 
+// QueryGameSessions est le navigateur de salons des applications Nintendo Classics (tenant
+// t-7b4e32ca-lp1 : N64, GBA, Game Boy, NES, Genesis). Sans elle le service rendait Unimplemented,
+// que le jeu affiche en 2321-4224.
+func (g *gameSessionServer) QueryGameSessions(ctx context.Context, req *mmpb.QueryGameSessionsRequest) (*mmpb.QueryGameSessionsResponse, error) {
+	log.Printf("[NPLN MM] QueryGameSessions tenant=%q view=%v config=%q minVacancy=%d users=%d pageSize=%d -> 0 salon(s)",
+		req.GetTenant(), req.GetView(), req.GetGameSessionSearchConfig(),
+		req.GetMinVacancyCount(), len(req.GetUsers()), req.GetPageSize())
+	return &mmpb.QueryGameSessionsResponse{}, nil
+}
+
 // JoinGameSession fait ENTRER l'invite dans la partie de l'hote.
 //
 // Second appel de l'invite, et le seul qui le rende visible des autres. La reponse a la meme forme
