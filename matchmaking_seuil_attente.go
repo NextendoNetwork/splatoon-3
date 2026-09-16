@@ -101,8 +101,16 @@ func (m *matchmakerServer) attenteLaPlusLongueLocked(cfg string) time.Duration {
 // L'assouplissement est donc DESACTIVE dans le code, pas seulement par drapeau : enlever un drapeau
 // ne doit plus pouvoir le ramener. seuilAssoupli reste presente et testee, mais plus personne ne
 // l'appelle en production.
+// REACTIVE le 2026-09-16. Mesure de la nuit : 8 joueurs simultanes ne se reunissent jamais — 28
+// billets, 12 annulations, zero partie, la file plafonnant a 2/8. Avec l'assouplissement rendu,
+// huit parties se sont formees en dix minutes et l'une d'elles est allee jusqu'au bout (premier
+// VsResults depuis le 25/08). « mmstrict » reste disponible pour l'eteindre sans redeploiement.
 func (m *matchmakerServer) seuilCourantLocked(cfg string, nominal int32) (int32, time.Duration) {
-	return nominal, m.attenteLaPlusLongueLocked(cfg)
+	attente := m.attenteLaPlusLongueLocked(cfg)
+	if soirFlag("mmstrict") {
+		return nominal, attente
+	}
+	return seuilAssoupli(nominal, attente), attente
 }
 
 // journaliserAssouplissement dit, UNE FOIS par palier et par file, que le seuil vient de descendre.
