@@ -15,14 +15,14 @@
 
 The game server for **Splatoon 3** on [Nextendo Network](https://nextendo.network).
 
-Splatoon 3 does not use NEX. It talks **NPLN** — Nintendo's newer stack: gRPC over HTTP/2, with
+Splatoon 3 does not use NEX. It talks **NPLN**, Nintendo's newer stack: gRPC over HTTP/2, with
 its own authentication, a Firestore-shaped document/watch service (`Gamesync`), matchmaking,
 friends and presence, cloud saves, schedules, and the Splatfest services. This repository is a
 from-scratch implementation of the server side of that stack, sufficient to bring the game's
 online mode up: booting into the square, friends and presence, private matches, public
 matchmaking, end-of-match verdicts, and Splatfests.
 
-It is a separate lineage from the NEX titles — it does not build on
+It is a separate lineage from the NEX titles: it does not build on
 [nextendo-nex](https://github.com/NextendoNetwork/nextendo-nex).
 
 > **Measured responses are not part of this repository.** A handful of replies were originally
@@ -39,7 +39,7 @@ cp example.env .env    # then edit .env
 go run .
 ```
 
-Configuration is entirely through environment variables — see [`example.env`](example.env). No
+Configuration is entirely through environment variables: see [`example.env`](example.env). No
 secrets are baked into the source; the defaults point at loopback, never at a live deployment.
 
 Set `NEXTENDO_SECRET` (or `NEXTENDO_SECRET_FILE`) before exposing this anywhere: it is what proves
@@ -52,20 +52,20 @@ decryption keys it hands out, and the BCAT delivery cache the console already ho
 fest whose packs the cache does not have and the game answers `BcatInvalid`.
 
 Two hot-reloaded flags describe your cache: `festcache=<FESTID>` names the fest it holds, and
-`festalias=<from>:<to>,…` rewrites the announced response to match it. Both empty — the default —
+`festalias=<from>:<to>,…` rewrites the announced response to match it. Both empty (the default)
 means the response is served exactly as built, with no rewriting. Your own keys go in `festcles`.
 
 ## Clients
 
 NPLN is spoken by the game, not by the console or the emulator: Splatoon 3 carries its own
 statically linked gRPC stack and does TLS over raw sockets. What a client has to provide is three
-things — it must resolve the NPLN hosts to this server, it must get past the game's own
+things: it must resolve the NPLN hosts to this server, it must get past the game's own
 certificate pinning, and it must present an identity this server's auth will accept.
 
 [Ryujinx-Nextendo](https://github.com/NextendoNetwork/Ryujinx-Nextendo) is the only client that
 does all three with no setup at all: the host redirection, the two built-in guest patches and the
 signed account token are already wired in. A real console reaches the same place with DNS
-redirection and the same patches applied — that is how this server was tested against hardware.
+redirection and the same patches applied: that is how this server was tested against hardware.
 Anything else has to reproduce those three conditions on its own; a client that satisfies none of
 them completes TLS and then abandons its own call before sending a single HTTP/2 HEADERS frame,
 which the game surfaces as a communication error.
@@ -78,5 +78,5 @@ with, endorsed by, or associated with Nintendo.
 
 ## License
 
-Released under the **[PolyForm Shield License 1.0.0](LICENSE.md)** — source-available: read, use,
+Released under the **[PolyForm Shield License 1.0.0](LICENSE.md)**, source-available: read, use,
 modify, and self-host, but do not use it to provide a product that competes with Nextendo Network.
