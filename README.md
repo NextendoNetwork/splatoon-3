@@ -70,6 +70,13 @@ Anything else has to reproduce those three conditions on its own; a client that 
 them completes TLS and then abandons its own call before sending a single HTTP/2 HEADERS frame,
 which the game surfaces as a communication error.
 
+## Live Service Bans
+
+This server has a unique ban configuration as Nextendo Account services do not provide same-session bans on accounts.
+I introduced this fix in order to block players that would intentionally use their auth token to cheat online after being banned. Once a ban is
+entered, GameSession immediately blocks all calls for their PID, SAVEID, and all of their credentials. I reconfigured ValidateToken to ensure the user can't just
+change a part of their nextendo_account.txt on Ryujinx to be able to bypass this ban.
+
 ## What this is not
 
 This server ships **no** Nintendo code, keys, measured data, or copyrighted assets. It is an
