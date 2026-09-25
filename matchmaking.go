@@ -135,10 +135,10 @@ func tenantFromCtx(ctx context.Context) string {
 // uidFromCtx returns the caller's user id from the `uid` metadata (e.g.
 // "u-exemple5000000000000"), used as the `sub` of the session JWT we mint.
 func uidFromCtx(ctx context.Context) string {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get("uid"); len(v) > 0 && v[0] != "" {
-			return v[0]
-		}
+	// Once authenticated, the server-signed subject is authoritative. The `uid` metadata is
+	// client-controlled and must not let a caller route another account's matchmaking or records.
+	if uid, ok := callerUIDFromJWT(ctx); ok {
+		return uid
 	}
 	return ""
 }
@@ -223,14 +223,14 @@ func (g *gameSessionServer) AllocateIceServerSet(ctx context.Context, req *mmpb.
 	// monde, alors que Nintendo repond
 	// « 1786797551:tenants/t-dce9377b-lp1/users/u-exemple6000000000000 ». Deux joueurs partageant un
 	// meme identifiant TURN se disputent la meme allocation sur le relais.
-	user := req.GetUser()
-	if user == "" {
-		if uid := uidFromCtx(ctx); uid != "" {
-			user = tn + "/users/" + uid
-		} else {
-			user = tn + "/users/" + capturedUser
-		}
+	uid := uidFromCtx(ctx)
+	if uid == "" {
+		return nil, status.Error(codes.Unauthenticated, "valid signed Nextendo identity required")
 	}
+	if requested := userIDFromPath(req.GetUser()); req.GetUser() != "" && requested != "current" && requested != uid {
+		return nil, status.Error(codes.PermissionDenied, "ICE allocation user does not match signed identity")
+	}
+	user := tn + "/users/" + uid
 	// 120 s EXACTEMENT, comme Nintendo.
 	//
 	// Mesure sur captured/AllocateIceServerSet.bin : l identifiant porte 1786138031 pour un updateTime
@@ -299,13 +299,18 @@ func (g *gameSessionServer) IssueUserDelegationToken(ctx context.Context, req *m
 	tn := tenantFromCtx(ctx)
 	uid := uidFromCtx(ctx)
 	if uid == "" {
-		uid = capturedUser
+		return nil, status.Error(codes.Unauthenticated, "valid signed Nextendo identity required")
 	}
 	delegator := req.GetDelegatorUser()
 	if delegator == "" || strings.HasSuffix(delegator, "/current") {
 		delegator = tn + "/users/" + uid
+	} else if userIDFromPath(delegator) != uid {
+		return nil, status.Error(codes.PermissionDenied, "delegator does not match signed identity")
 	}
 	mandatary := req.GetMandataryUser() // the teammate the token delegates for (concrete resource)
+	if !validBanUID(userIDFromPath(mandatary)) {
+		return nil, status.Error(codes.InvalidArgument, "invalid delegation target")
+	}
 	// ES256 delegation token bound to the mandatary, same signer/jku/kid as the access/session tokens.
 	token := mintSessionToken(userIDFromPath(mandatary), tn, tn+"/delegations/"+uuid4(), mandatary)
 	detail := &mmpb.UserDelegationDetail{
@@ -493,7 +498,7 @@ func (g *gameSessionServer) CreateGameSessionCreationTicket(ctx context.Context,
 	// (SessionAlone / JoinedSessionEmpty) and bounce. Build the concrete user from the metadata.
 	uid := uidFromCtx(ctx)
 	if uid == "" {
-		uid = capturedUser
+		return nil, status.Error(codes.Unauthenticated, "valid signed Nextendo identity required")
 	}
 	concreteUser := tn + "/users/" + uid
 

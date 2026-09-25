@@ -69,9 +69,9 @@ func traceInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, 
 // process share matchmaking, pass the same matchmaker to each server.
 func buildServer(creds credentials.TransportCredentials, sharedMatchmakers ...*matchmakerServer) *grpc.Server {
 	opts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(chaineUnaire(typeGrpcUnaire, traceInterceptor)),
+		grpc.UnaryInterceptor(chaineUnaire(typeGrpcUnaire, chaineUnaire(traceInterceptor, banUnaryInterceptor))),
 		// npln-grpc-type sur CHAQUE reponse, comme la passerelle de Nintendo (voir npln_grpc_type.go).
-		grpc.StreamInterceptor(typeGrpcFlux),
+		grpc.StreamInterceptor(chaineFlux(banStreamInterceptor, typeGrpcFlux)),
 		grpc.ForceServerCodec(newHybridCodec()),
 		grpc.UnknownServiceHandler(replayHandler),
 		grpc.StatsHandler(connTracer{}),
@@ -130,6 +130,10 @@ func buildServer(creds credentials.TransportCredentials, sharedMatchmakers ...*m
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC)
+	if len(os.Args) > 1 {
+		os.Exit(runBanCLI(os.Args[1:]))
+	}
+	startBanMonitor()
 	addr := envOr("NPLN_LISTEN", ":7443")
 	certFile := envOr("CERT_FILE", `C:\Dev\Dev\reverse eden\server\certs\local_server_cert.pem`)
 	keyFile := envOr("KEY_FILE", `C:\Dev\Dev\reverse eden\server\certs\local_server_key.pem`)

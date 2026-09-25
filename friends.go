@@ -46,8 +46,8 @@ func capturedSubscribeFriendUsers() (*friendspb.SubscribeFriendUsersResponse, bo
 // nplnTenant is the Splatoon 3 (1.0.0) tenant path all user resources hang off.
 const nplnTenant = "tenants/t-dce9377b-lp1"
 
-// callerPID extracts the caller's Nextendo account PID from the access token that S3
-// echoes back in `authorization: bearer nextendo-npln-access.<pid>` (issued by auth).
+// callerPID extracts the caller's Nextendo account PID from the server-signed access JWT that S3
+// echoes in the authorization metadata.
 func callerPID(ctx context.Context) (uint64, bool) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	for _, a := range md.Get("authorization") {
@@ -55,24 +55,11 @@ func callerPID(ctx context.Context) (uint64, bool) {
 		a = strings.TrimPrefix(a, "Bearer ")
 		a = strings.TrimPrefix(a, "bearer ")
 
-		// The access token is now the ES256 JWT Nintendo's shape requires (token_jwt.go); we
-		// carry the PID in npln.ext_id, so read it back from there.
+		// The ES256 JWT carries the PID in npln.ext_id; pidFromJWT verifies its signature first.
 		if pid, ok := pidFromJWT(a); ok {
 			return pid, true
 		}
 
-		// Jeton opaque legacy (d'avant la bascule JWT du 2026-07-16) : trivialement forgeable
-		// — un simple numéro, sans aucune preuve. On ne l'accepte plus qu'en mode dev explicite ;
-		// en prod il est refusé (ces jetons ont de toute façon expiré depuis longtemps, TTL 8 h).
-		if allowUnverified() {
-			const pfx = "nextendo-npln-access."
-			if strings.HasPrefix(a, pfx) {
-				seg := strings.SplitN(a[len(pfx):], ".", 2)[0]
-				if pid, err := strconv.ParseUint(seg, 10, 64); err == nil {
-					return pid, true
-				}
-			}
-		}
 	}
 	return 0, false
 }
@@ -83,30 +70,74 @@ func callerPID(ctx context.Context) (uint64, bool) {
 // friends/présence (accountFriends(pid) ne prouve que l'EXISTENCE du compte, pas que l'appelant
 // EST ce compte). On l'a signé avec notre clé (token_jwt.go) ; on le vérifie avec la même clé.
 func pidFromJWT(tok string) (uint64, bool) {
+	pid, _, ok := identityFromJWT(tok)
+	return pid, ok && pid != 0
+}
+
+// userIDFromJWT returns the subject only from a valid server-signed token. Request
+// metadata is client-controlled, so UID-based bans and save ownership must prefer this.
+func userIDFromJWT(tok string) (string, bool) {
+	_, uid, ok := identityFromJWT(tok)
+	return uid, ok && uid != ""
+}
+
+func identityFromJWT(tok string) (uint64, string, bool) {
 	parts := strings.Split(tok, ".")
 	if len(parts) != 3 || !strings.HasPrefix(parts[0], "ey") {
-		return 0, false
+		return 0, "", false
 	}
 	if !verifyNplnAccessToken(parts[0], parts[1], parts[2]) {
-		return 0, false
+		return 0, "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return 0, false
+		return 0, "", false
 	}
 	var claims struct {
+		Sub  string `json:"sub"`
+		Iat  int64  `json:"iat"`
+		Exp  int64  `json:"exp"`
+		Iss  string `json:"iss"`
 		Npln struct {
 			ExtID string `json:"ext_id"`
 		} `json:"npln"`
 	}
-	if json.Unmarshal(raw, &claims) != nil || claims.Npln.ExtID == "" {
-		return 0, false
+	now := time.Now().Unix()
+	if json.Unmarshal(raw, &claims) != nil || claims.Exp <= now || claims.Iat <= 0 || claims.Iat > now+60 || claims.Iss != nplnIssuer || claims.Sub == "" {
+		return 0, "", false
 	}
-	pid, err := strconv.ParseUint(claims.Npln.ExtID, 16, 64)
-	if err != nil {
-		return 0, false
+	uid := userIDFromPath(claims.Sub)
+	if !validBanUID(uid) || cleanBanUID(uid) != uid {
+		return 0, "", false
 	}
-	return pid, true
+	var pid uint64
+	if claims.Npln.ExtID != "" {
+		pid, err = strconv.ParseUint(claims.Npln.ExtID, 16, 64)
+		if err != nil {
+			return 0, "", false
+		}
+	}
+	return pid, uid, true
+}
+
+func callerUIDFromJWT(ctx context.Context) (string, bool) {
+	_, uid, ok := callerIdentityFromJWT(ctx)
+	return uid, ok && uid != ""
+}
+
+func callerIdentityFromJWT(ctx context.Context) (uint64, string, bool) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	for _, authorization := range md.Get("authorization") {
+		a := strings.TrimSpace(authorization)
+		fields := strings.Fields(a)
+		if len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+			a = fields[1]
+		}
+		if pid, uid, ok := identityFromJWT(a); ok && pid != 0 && uid != "" {
+			return pid, uid, true
+		}
+	}
+	return 0, "", false
 }
 
 type friendsServer struct {

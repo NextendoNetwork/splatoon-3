@@ -3,7 +3,8 @@ package main
 // token_jwt — mint the NPLN access token as a REAL signed JWT, the way Nintendo does.
 //
 // Why this exists (2026-07-16): we used to hand S3 the opaque string
-// "nextendo-npln-access.<pid>". The MITM capture of 2026-06-28
+// nextendo-npln-access.<pid>. The MITM capture of 2026-06-28 shows Nintendo expects
+// an ES256 Nextendo NPLN access token instead.
 // (dist/Nextendo-MITM-Splatoon3v3/capture_log.txt — decrypted HTTP/2, headers in clear)
 // shows Nintendo's real answer is an ES256 JWT whose payload carries the player's ONLINE
 // RIGHTS:
@@ -129,22 +130,15 @@ func userIDFromPath(userPath string) string {
 // mintNplnAccessToken builds the ES256 JWT S3 expects, granting full rights (allow ["**"],
 // nso_restricted false) exactly as Nintendo's own token does for a licensed player.
 func mintNplnAccessToken(pid uint64, userPath, tenant string) string {
+	uid := userIDFromPath(userPath)
+	if pid == 0 || !validBanUID(uid) {
+		return ""
+	}
 	key, kid := nplnSigningKey()
 	if key == nil {
-		return "nextendo-npln-access." + itoa(pid) // last-resort fallback: never silently fail
+		return ""
 	}
 
-	uid := userIDFromPath(userPath)
-
-	// DIAGNOSTIC (NPLN_JWT_SUB_CAPTURED=1): mint the token for the CAPTURE's user instead of the
-	// Nextendo one. The opaque token left the game without a firm identity; the JWT gives it one
-	// via `sub`, and every replayed body we serve (GetSaveRecord, SubscribeFriendUsers…) belongs
-	// to the capture user u-exemple5000000000000. If S3 is waiting on data about *itself* that
-	// never arrives, aligning sub with the replays unblocks it — and proves the mismatch is the
-	// cause. Not a fix to keep: the real answer is to rewrite the replays to the live identity.
-	if os.Getenv("NPLN_JWT_SUB_CAPTURED") != "" {
-		uid = capturedUser
-	}
 	now := time.Now()
 
 	header := map[string]any{"alg": "ES256", "jku": nplnJKU, "kid": kid}
@@ -177,7 +171,7 @@ func mintNplnAccessToken(pid uint64, userPath, tenant string) string {
 	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
 	if err != nil {
 		log.Printf("[NPLN Auth] sign: %v", err)
-		return "nextendo-npln-access." + itoa(pid)
+		return ""
 	}
 	// JWS ES256: r||s, each left-padded to 32 bytes (NOT the ASN.1 DER form).
 	sig := make([]byte, 64)
@@ -210,12 +204,12 @@ func appIDForTenant(tenant string) string {
 }
 
 func mintSessionToken(uid, tenant, gsName, userSess string) string {
+	if !validBanUID(uid) {
+		return ""
+	}
 	key, kid := nplnSigningKey()
 	if key == nil {
-		return "nextendo-gss.fallback" // never silently fail
-	}
-	if uid == "" {
-		uid = capturedUser
+		return ""
 	}
 	now := time.Now()
 
@@ -251,7 +245,7 @@ func mintSessionToken(uid, tenant, gsName, userSess string) string {
 	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
 	if err != nil {
 		log.Printf("[NPLN MM] session token sign: %v", err)
-		return "nextendo-gss.fallback"
+		return ""
 	}
 	sig := make([]byte, 64)
 	copyRightAligned(sig[:32], r)
@@ -281,12 +275,12 @@ func mintGssMatchToken(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON s
 }
 
 func mintGssMatchTokenWithRoute(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON string, route gssSessionRoute) string {
+	if !validBanUID(uid) {
+		return ""
+	}
 	key, kid := nplnSigningKey()
 	if key == nil {
-		return "nextendo-gss.fallback"
-	}
-	if uid == "" {
-		uid = capturedUser
+		return ""
 	}
 	now := time.Now()
 	tid := strings.TrimPrefix(tenant, "tenants/")
@@ -341,7 +335,7 @@ func mintGssMatchTokenWithRoute(uid, tenant, gsName, userSess, team, attrJSON, l
 	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
 	if err != nil {
 		log.Printf("[NPLN MM] gss match token sign: %v", err)
-		return "nextendo-gss.fallback"
+		return ""
 	}
 	sig := make([]byte, 64)
 	copyRightAligned(sig[:32], r)

@@ -30,10 +30,13 @@ const (
 	uidCapture  = "u-exemple7000000000000"
 )
 
-// ctxJoueur reproduit ce que le transport pose : l'uid de l'appelant et son locataire.
+// ctxJoueur reproduit l'identite authentifiee : un UID seul dans les metadonnees est
+// fourni par le client et ne peut plus etre utilise comme preuve d'identite.
 func ctxJoueur(uid string) context.Context {
+	token := mintNplnAccessToken(1800004321, nplnTenant+"/users/"+uid, nplnTenant)
 	return metadata.NewIncomingContext(context.Background(), metadata.Pairs(
-		"uid", uid,
+		"authorization", "Bearer "+token,
+		"uid", "spoofed-client-metadata",
 		"npln-tenant-id", "t-dce9377b-lp1",
 	))
 }

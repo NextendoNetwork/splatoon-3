@@ -6,9 +6,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +21,13 @@ import (
 var accountBaseURL = envOr("NEXTENDO_ACCOUNT_URL", "http://nextendo-account:8080")
 
 var accountHTTP = &http.Client{Timeout: 5 * time.Second}
+
+func accountRequest(request *http.Request) (*http.Response, error) {
+	if key := strings.TrimSpace(os.Getenv("NEXTENDO_INTERNAL_KEY")); key != "" {
+		request.Header.Set("X-Internal-Key", key)
+	}
+	return accountHTTP.Do(request)
+}
 
 // nplnFriendData mirrors one entry of /internal/npln-friends.
 type nplnFriendData struct {
@@ -36,24 +45,79 @@ type nplnAccountData struct {
 	UserID     string           `json:"user_id"`
 	AccountHex string           `json:"account_hex"`
 	Verified   bool             `json:"verified"`
+	Disabled   bool             `json:"disabled"`
 	Friends    []nplnFriendData `json:"friends"`
 }
 
+type nplnAccountHTTPError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *nplnAccountHTTPError) Error() string { return e.Status }
+
 // accountFriends fetches an account's NPLN identity + friend graph by PID.
 func accountFriends(pid uint64) (*nplnAccountData, error) {
-	resp, err := accountHTTP.Get(fmt.Sprintf("%s/internal/npln-friends?pid=%d", accountBaseURL, pid))
+	request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/internal/npln-friends?pid=%d", accountBaseURL, pid), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := accountRequest(request)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("npln-friends pid=%d: %s", pid, resp.Status)
+		return nil, &nplnAccountHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     fmt.Sprintf("npln-friends pid=%d: %s", pid, resp.Status),
+		}
 	}
 	var out nplnAccountData
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func accountLookupNotFound(err error) bool {
+	var httpErr *nplnAccountHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
+// accountPIDForUID resolves the account PID for a canonical NPLN save UID. The reverse lookup
+// is intentionally server-to-server; the game client never receives this account-directory API.
+func accountPIDForUID(uid string) (uint64, error) {
+	uid = cleanBanUID(uid)
+	if !validBanUID(uid) {
+		return 0, fmt.Errorf("invalid save UID")
+	}
+	request, err := http.NewRequest(http.MethodGet, accountBaseURL+"/internal/npln-user-id?user_id="+url.QueryEscape(uid), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := accountRequest(request)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, &nplnAccountHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     fmt.Sprintf("npln-user-id uid=%s: %s", uid, resp.Status),
+		}
+	}
+	var out struct {
+		PID    uint64 `json:"pid"`
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	if out.PID == 0 || cleanBanUID(out.UserID) != uid {
+		return 0, fmt.Errorf("account service returned an inconsistent UID/PID mapping")
+	}
+	return out.PID, nil
 }
 
 // resolveNSAToPID maps an NSA id (as the console presents it) to the owning Nextendo

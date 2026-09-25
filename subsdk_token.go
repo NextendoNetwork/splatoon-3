@@ -7,9 +7,9 @@ package main
 //	base64(json) + "," + hmac_sha256_hex(base64_part)
 //
 // where json is the identity payload (BuildAuthJson in the subsdk) and the HMAC is
-// keyed with the subsdk's shared secret (kAuthHmacSecret). The identity lives in the
-// "account_bytes" field — the hex of the console's account.dat. We verify the HMAC so
-// a client cannot forge an identity without the subsdk secret.
+// keyed with the subsdk's shared secret (kAuthHmacSecret). Since the key is shipped to the
+// client, this parser can diagnose token format but MUST NOT authorize an account from
+// "account_bytes". Online identity is proven by the server-signed Nextendo nnex token.
 
 import (
 	"crypto/hmac"
@@ -31,12 +31,6 @@ import (
 // la meme valeur — et changez-la si vous la soupconnez exposee.
 var subsdkAuthSecret = os.Getenv("NPLN_AUTH_HMAC_SECRET")
 
-// autoriserJetonsNonVerifies : n'accepter un jeton non signe que si l'operateur le demande
-// EXPLICITEMENT. Sert au developpement local, jamais a un service ouvert.
-func autoriserJetonsNonVerifies() bool {
-	return os.Getenv("NPLN_ALLOW_UNVERIFIED") == "1"
-}
-
 // subsdkClaims mirrors the JSON payload the subsdk base64-encodes in its token.
 type subsdkClaims struct {
 	Timestamp       int64  `json:"timestamp"`
@@ -50,24 +44,22 @@ type subsdkClaims struct {
 	UserSHA         string `json:"user_config_sha256"`
 }
 
-// parseSubsdkToken decodes and (unless the secret is empty) verifies the subsdk token.
-// Returns the claims on success.
+// parseSubsdkToken decodes the client-shared format for diagnostics. A valid HMAC here does not
+// establish account ownership and must never be used as an authorization decision.
 func parseSubsdkToken(tok string) (*subsdkClaims, bool) {
 	i := strings.IndexByte(tok, ',')
 	if i <= 0 || i+1 >= len(tok) {
 		return nil, false
 	}
 	b64, mac := tok[:i], tok[i+1:]
-	if subsdkAuthSecret == "" && !autoriserJetonsNonVerifies() {
-		return nil, false // pas de cle : on ne peut rien prouver, donc on refuse
+	if subsdkAuthSecret == "" {
+		return nil, false
 	}
-	if subsdkAuthSecret != "" {
-		h := hmac.New(sha256.New, []byte(subsdkAuthSecret))
-		h.Write([]byte(b64))
-		want := hex.EncodeToString(h.Sum(nil))
-		if !hmac.Equal([]byte(strings.ToLower(mac)), []byte(want)) {
-			return nil, false
-		}
+	h := hmac.New(sha256.New, []byte(subsdkAuthSecret))
+	h.Write([]byte(b64))
+	want := hex.EncodeToString(h.Sum(nil))
+	if !hmac.Equal([]byte(strings.ToLower(mac)), []byte(want)) {
+		return nil, false
 	}
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {

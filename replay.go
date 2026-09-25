@@ -452,12 +452,11 @@ func buildRecvFromUserPath(userpath, payload []byte, cursor string) []byte {
 // session collection for its OWN user id, never finds it (the replays name a different user), logs
 // "Timed out to get my UserSession." and never advances to the plaza (RE: S3_PLAZA_GATE_FINDINGS.md).
 func liveReplayUID(stream grpc.ServerStream) string {
-	if pid, ok := callerPID(stream.Context()); ok {
-		if me, err := accountFriends(pid); err == nil && me.UserID != "" {
-			return me.UserID
-		}
+	uid, ok := callerUIDFromJWT(stream.Context())
+	if !ok || !validBanUID(uid) {
+		return ""
 	}
-	return capturedUser
+	return uid
 }
 
 // rewriteCapturedIdentity replaces the capture user's id with the live session's id inside captured
@@ -752,6 +751,10 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 	// your in-game name, restart the emulator, and the CAPTURE's old name is back -- nothing the
 	// player does is ever kept. Store what the client writes, per user, and hand it back on read.
 	if strings.Contains(method, "CloudSave/WriteSaveRecord") {
+		uid := saveOwner(stream.Context())
+		if uid == "" {
+			return status.Error(codes.Unauthenticated, "valid Nextendo account required for cloud saves")
+		}
 		var wreq rawMsg
 		var body []byte
 		for stream.RecvMsg(&wreq) == nil {
@@ -760,8 +763,6 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			}
 			wreq = rawMsg{}
 		}
-
-		uid := saveOwner(stream.Context())
 
 		req := &toyohrpb.WriteSaveRecordRequest{}
 		if err := proto.Unmarshal(body, req); err != nil {
@@ -822,6 +823,10 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 	}
 
 	if strings.Contains(method, "CloudSave/GetSaveRecord") {
+		uid := saveOwner(stream.Context())
+		if uid == "" {
+			return status.Error(codes.Unauthenticated, "valid Nextendo account required for cloud saves")
+		}
 		var greq rawMsg
 		var greqBody []byte
 		for stream.RecvMsg(&greq) == nil {
@@ -836,8 +841,6 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		// que son etat local n'est PAS celui d'un compte neuf — et c'est ce qui expliquerait qu'il
 		// n'appelle jamais CreateSaveRecord la ou la console le faisait 7 s apres.
 		log.Printf("[NPLN CloudSave] GetSaveRecord requete (%d o) : %x", len(greqBody), greqBody)
-
-		uid := saveOwner(stream.Context())
 
 		// Joueur sans sauvegarde cloud : lui en creer une VIERGE, plutot que de repondre vide.
 		//
@@ -929,6 +932,10 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 
 	// CreateSaveRecord: the client hands us a COMPLETE SaveRecord built from its local save.
 	if strings.Contains(method, "CloudSave/CreateSaveRecord") {
+		uid := saveOwner(stream.Context())
+		if uid == "" {
+			return status.Error(codes.Unauthenticated, "valid Nextendo account required for cloud saves")
+		}
 		var creq rawMsg
 		var body []byte
 		for stream.RecvMsg(&creq) == nil {
@@ -938,7 +945,6 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			creq = rawMsg{}
 		}
 
-		uid := saveOwner(stream.Context())
 		req := &toyohrpb.CreateSaveRecordRequest{}
 		if err := proto.Unmarshal(body, req); err != nil {
 			log.Printf("[NPLN CloudSave] CreateSaveRecord uid=%s: illisible: %v", uid, err)
@@ -967,6 +973,10 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 	// (proven: presence attributes PlayerName, locker documents Player.UserName and the matchmaking
 	// session attributes are all denormalised copies the client derives from the SaveRecord).
 	if strings.Contains(method, "CloudSave/ChangeUserName") {
+		uid := saveOwner(stream.Context())
+		if uid == "" {
+			return status.Error(codes.Unauthenticated, "valid Nextendo account required for cloud saves")
+		}
 		var creq rawMsg
 		var body []byte
 		for stream.RecvMsg(&creq) == nil {
@@ -976,7 +986,6 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			creq = rawMsg{}
 		}
 
-		uid := saveOwner(stream.Context())
 		req := &toyohrpb.ChangeUserNameRequest{}
 		if err := proto.Unmarshal(body, req); err != nil || req.GetUserName() == "" {
 			log.Printf("[NPLN CloudSave] ChangeUserName uid=%s: requete illisible: %v", uid, err)
@@ -1009,20 +1018,9 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		for stream.RecvMsg(&vreq) == nil {
 			vreq = rawMsg{}
 		}
-		uid := capturedUser
-		if pid, ok := callerPID(stream.Context()); ok {
-			if me, err := accountFriends(pid); err == nil && me.UserID != "" {
-				uid = me.UserID
-			}
-		}
-		// [Nextendo] When we serve the CAPTURE's identity everywhere (NPLN_JWT_SUB_CAPTURED),
-		// the violations resource MUST use that same user id too — otherwise the game logs in as
-		// the capture user but gets a violations path for a DIFFERENT user (moha), the screening
-		// object is self-inconsistent, and the post-login state machine parks on the ink loading
-		// screen (never advancing to SubscribeFriendUsers / the plaza). Keep the whole session on
-		// ONE identity.
-		if os.Getenv("NPLN_JWT_SUB_CAPTURED") != "" {
-			uid = capturedUser
+		uid := liveReplayUID(stream)
+		if uid == "" {
+			return status.Error(codes.Unauthenticated, "valid signed Nextendo identity required")
 		}
 		// [Nextendo] The path must carry a violation ID after "violations" -- a collection path is
 		// rejected. Disassembly of the parser (Thunder.nss:0x7d58a0, called from 0x7d5eac; on
@@ -1317,29 +1315,25 @@ func savePath(uid string) string {
 	return filepath.Join(saveDir(), safe+".save")
 }
 
-// saveOwner returns the account service's canonical UID for a verified signed
-// caller. The NPLN uid metadata is client-controlled and must never select a
-// cloud-save file. Missing identity or an account lookup failure fails closed.
+// saveOwner returns the account service's canonical UID only for a caller with a
+// valid signed access token whose PID and UID both match the account service.
+// Client-supplied UID metadata can never select a cloud-save file.
 func saveOwner(ctx context.Context) string {
-	// L'identite du proprietaire vient du JETON VERIFIE, pas de ce que le client declare.
-	//
-	// On lisait l'uid des metadonnees de la requete — une valeur que le client choisit. N'importe
-	// qui pouvait donc reclamer l'uid d'un autre et lire ou ecrire SA sauvegarde (niveau, argent,
-	// progression). callerPID, lui, verifie la signature ES256 du jeton d'acces avant d'en tirer le
-	// PID : c'est la meme preuve que celle deja exigee pour les amis et la presence.
 	if pid, ok := callerPID(ctx); ok {
-		if acc, err := accountFriends(pid); err == nil && acc.UserID != "" {
-			return acc.UserID
+		if acc, err := accountFriends(pid); err == nil && acc != nil && acc.PID == pid {
+			uid := cleanBanUID(acc.UserID)
+			if !validBanUID(uid) {
+				return ""
+			}
+			if tokenUID, signed := callerUIDFromJWT(ctx); !signed || tokenUID != uid {
+				return ""
+			}
+			if err := playerBans.requireAllowed(pid, uid); err == nil {
+				return uid
+			}
 		}
 	}
-
-	// Pas de jeton exploitable : on retombe sur l'uid declare. L'ancien repli renvoyait
-	// capturedUser pour TOUT LE MONDE, donc deux joueurs non identifies ecrivaient dans le MEME
-	// fichier de sauvegarde.
-	if uid := uidFromCtx(ctx); uid != "" {
-		return uid
-	}
-	return capturedUser
+	return ""
 }
 
 func (s *cloudSaveStore) put(uid string, blob []byte) {

@@ -1222,7 +1222,7 @@ func gsNul() *commonpb.Value {
 // parses: uid/ussid/ucsid/upcsid/pgn (read there) plus st/att/ltc/tn (read by the fuller
 // accessor set @0xd919xx). uss = the userSession uuid.
 func userSessionFields(info *gsSessionInfo, uss string) *commonpb.MapValue {
-	uid := capturedUser
+	uid := ""
 	rang := 1
 	if info != nil && info.uid != "" {
 		uid = info.uid
@@ -1267,7 +1267,7 @@ func userSessionFields(info *gsSessionInfo, uss string) *commonpb.MapValue {
 // (strings) + pl/mp (maps). Previously we wrongly fed it userSessionFields (uid/ussid/…), so the
 // per-user state readback was empty on the create/keep path.
 func stateUserFields(info *gsSessionInfo, uss string) *commonpb.MapValue {
-	uid := capturedUser
+	uid := ""
 	if info != nil && info.uid != "" {
 		uid = info.uid
 	}
