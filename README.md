@@ -55,59 +55,6 @@ Two hot-reloaded flags describe your cache: `festcache=<FESTID>` names the fest 
 `festalias=<from>:<to>,…` rewrites the announced response to match it. Both empty — the default —
 means the response is served exactly as built, with no rewriting. Your own keys go in `festcles`.
 
-## Editing a player save
-
-`cmd/saveedit` includes a local browser GUI for the server's `*.record.pb` CloudSave files. Choose a
-player save, edit its `save_data` as formatted JSON, and save it back as protobuf. It also has CLI
-commands to list, inspect, and directly patch records. Every edit creates a byte-for-byte
-`.bak-<UTC timestamp>` copy, advances the protobuf `update_time`, writes through a synced temporary
-file, and reads the result back to verify the protobuf before replacing the original. The GUI
-preserves protobuf data outside the fields you edit and detects if the selected file changed after
-you loaded it.
-
-**Stop the NPLN server before editing.** It caches records in memory, so editing the file while the
-process is running can be overwritten by a later game save. Stop the server, make the edits, restart
-the server, then restart the game so it fetches the new cloud record.
-
-Build and launch the GUI on the machine that has the save directory:
-
-```sh
-go build -o saveedit ./cmd/saveedit
-./saveedit gui /data/saves
-```
-
-Open `http://127.0.0.1:8765/` in a browser. The editor listens on loopback only. `NPLN_SAVE_DIR` is
-used when no directory argument is supplied; otherwise the default is `/data/saves`. Stop the
-editor with Ctrl+C after editing, then restart the NPLN server and game.
-
-The CLI is still available for quick one-off changes:
-
-```sh
-./saveedit list /data/saves
-./saveedit show /data/saves/u-example.record.pb
-./saveedit set /data/saves/u-example.record.pb Money 50000
-```
-
-For multiple fields, put their values in `changes.json` and apply them together:
-
-```json
-{
-  "PlayerRank": 9,
-  "Money": 50000,
-  "WeaponLicense": 10
-}
-```
-
-```sh
-./saveedit patch /data/saves/u-example.record.pb changes.json
-```
-
-JSON integers stay 64-bit integers; strings, booleans, floats, arrays, objects and null are
-supported. Special protobuf types can be entered with wrappers such as `{"$float32":1.5}` or
-`{"$timestamp":"2026-09-24T20:00:00Z"}`. The `show` command prints the record using the same
-wrappers, so a value can be copied back without changing its protobuf type. Nested map values use
-dot paths, for example `SomeMap.SomeField`; sibling fields remain untouched.
-
 ## Clients
 
 NPLN is spoken by the game, not by the console or the emulator: Splatoon 3 carries its own
