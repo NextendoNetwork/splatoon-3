@@ -22,12 +22,12 @@ package main
 
 import (
 	"encoding/binary"
-	"log"
 	"net"
 	"sort"
 	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -57,7 +57,17 @@ type compteurTrames struct {
 	demarrage time.Time
 }
 
-func (c *compteurTrames) noter(sens string, typ byte, flags byte, streamID uint32, taille int) {
+func (c *compteurTrames) noter(sens string, typ byte, flags byte, streamID uint32, payload []byte) {
+	taille := len(payload)
+	if typ == 0x7 && len(payload) >= 8 {
+		debugLogf("[NPLN transport] remote=%s direction=%s GOAWAY last_stream=%d code=%s debug_bytes=%d", c.tag, sens, binary.BigEndian.Uint32(payload[:4])&0x7fffffff, http2.ErrCode(binary.BigEndian.Uint32(payload[4:8])), len(payload)-8)
+	}
+	if typ == 0x3 && len(payload) == 4 {
+		debugLogf("[NPLN transport] remote=%s direction=%s RST_STREAM stream=%d code=%s", c.tag, sens, streamID, http2.ErrCode(binary.BigEndian.Uint32(payload)))
+	}
+	if !soirFlag("frames") {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -75,7 +85,7 @@ func (c *compteurTrames) noter(sens string, typ byte, flags byte, streamID uint3
 
 	// RST_STREAM et GOAWAY sont rares et decisifs : on les nomme un par un, jamais en resume.
 	if typ == 0x3 || typ == 0x7 {
-		log.Printf("[NPLN trames] %s %s %s flux=%d taille=%d drapeaux=0x%02x",
+		debugLogf("[NPLN trames] %s %s %s flux=%d taille=%d drapeaux=0x%02x",
 			c.tag, sens, nommerTrame(typ), streamID, taille, flags)
 	}
 
@@ -88,10 +98,10 @@ func (c *compteurTrames) noter(sens string, typ byte, flags byte, streamID uint3
 	for _, n := range c.parType {
 		total += n
 	}
-	log.Printf("[NPLN trames] %s resume apres %.0f s : %d trames sur %d flux",
+	debugLogf("[NPLN trames] %s resume apres %.0f s : %d trames sur %d flux",
 		c.tag, time.Since(c.demarrage).Seconds(), total, len(c.flux))
 	for cle, n := range c.parType {
-		log.Printf("[NPLN trames]   %s : %d trames, %d o", cle, n, c.octets[cle])
+		debugLogf("[NPLN trames]   %s : %d trames, %d o", cle, n, c.octets[cle])
 	}
 
 	// PAR FLUX : c'est la seule facon de savoir LEQUEL des flux longs porte le va-et-vient. Le
@@ -111,7 +121,7 @@ func (c *compteurTrames) noter(sens string, typ byte, flags byte, streamID uint3
 		if i >= 6 {
 			break
 		}
-		log.Printf("[NPLN trames]   flux %d : %d trames, DATA recu %d o / emis %d o",
+		debugLogf("[NPLN trames]   flux %d : %d trames, DATA recu %d o / emis %d o",
 			l.id, l.n, c.dataRecu[l.id], c.dataEmis[l.id])
 	}
 }
@@ -131,7 +141,7 @@ type connTracee struct {
 	prefaceRestant int
 }
 
-func decouper(reste []byte, buf []byte, noter func(typ, flags byte, id uint32, n int)) []byte {
+func decouper(reste []byte, buf []byte, noter func(typ, flags byte, id uint32, payload []byte)) []byte {
 	flux := append(reste, buf...)
 
 	for len(flux) >= 9 {
@@ -143,12 +153,12 @@ func decouper(reste []byte, buf []byte, noter func(typ, flags byte, id uint32, n
 		if 9+taille > len(flux) {
 			break // trame incomplete : on garde ce qu'on a
 		}
-		noter(typ, flags, id, taille)
+		noter(typ, flags, id, flux[9:9+taille])
 		flux = flux[9+taille:]
 	}
 
 	// Ne jamais laisser le tampon d'attente grossir sans borne (charge utile max = 16 Mo).
-	if len(flux) > 1<<20 {
+	if len(flux) > (1<<24)+9 {
 		return nil
 	}
 
@@ -157,7 +167,10 @@ func decouper(reste []byte, buf []byte, noter func(typ, flags byte, id uint32, n
 
 func (c *connTracee) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	if n <= 0 || !soirFlag("frames") {
+	if err != nil {
+		debugLogf("[NPLN transport] remote=%s read bytes=%d error=%v", c.cpt.tag, n, err)
+	}
+	if n <= 0 {
 		return n, err
 	}
 
@@ -169,8 +182,8 @@ func (c *connTracee) Read(b []byte) (int, error) {
 	}
 
 	if len(vu) > 0 {
-		c.resteRecu = decouper(c.resteRecu, vu, func(t, f byte, id uint32, taille int) {
-			c.cpt.noter("recu", t, f, id, taille)
+		c.resteRecu = decouper(c.resteRecu, vu, func(t, f byte, id uint32, payload []byte) {
+			c.cpt.noter("recu", t, f, id, payload)
 		})
 	}
 
@@ -178,12 +191,21 @@ func (c *connTracee) Read(b []byte) (int, error) {
 }
 
 func (c *connTracee) Write(b []byte) (int, error) {
-	if soirFlag("frames") {
-		c.resteEmis = decouper(c.resteEmis, b, func(t, f byte, id uint32, taille int) {
-			c.cpt.noter("emis", t, f, id, taille)
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.resteEmis = decouper(c.resteEmis, b[:n], func(t, f byte, id uint32, payload []byte) {
+			c.cpt.noter("emis", t, f, id, payload)
 		})
 	}
-	return c.Conn.Write(b)
+	if err != nil {
+		debugLogf("[NPLN transport] remote=%s write bytes=%d error=%v", c.cpt.tag, n, err)
+	}
+	return n, err
+}
+
+func (c *connTracee) Close() error {
+	debugLogf("[NPLN transport] remote=%s local_close", c.cpt.tag)
+	return c.Conn.Close()
 }
 
 // credsTracees enveloppe les identifiants TLS pour tracer le flux DECHIFFRE.
@@ -199,11 +221,15 @@ func (c credsTracees) ServerHandshake(raw net.Conn) (net.Conn, credentials.AuthI
 
 	// Le preambule HTTP/2 du client (« PRI * HTTP/2.0 ... », 24 octets) precede la premiere trame ;
 	// on le saute en amorcant le decodeur avec, sinon tout le flux recu est decale.
-	tracee := &connTracee{
+	return traceHTTP2Connection(conn), info, err
+}
+
+func traceHTTP2Connection(conn net.Conn) net.Conn {
+	return &connTracee{
 		Conn:           conn,
-		prefaceRestant: len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+		prefaceRestant: len(http2.ClientPreface),
 		cpt: &compteurTrames{
-			tag:       raw.RemoteAddr().String(),
+			tag:       conn.RemoteAddr().String(),
 			parType:   map[string]int{},
 			octets:    map[string]int{},
 			flux:      map[uint32]int{},
@@ -213,8 +239,6 @@ func (c credsTracees) ServerHandshake(raw net.Conn) (net.Conn, credentials.AuthI
 			demarrage: time.Now(),
 		},
 	}
-
-	return tracee, info, err
 }
 
 // tracerLesTrames enveloppe des identifiants TLS pour compter les trames HTTP/2 qui les traversent.

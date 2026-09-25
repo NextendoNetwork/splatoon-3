@@ -82,29 +82,9 @@ func mmConfig() (relayHost string, relayPort int32, stunHost string, stunPort in
 	// identifiants TURN ne sont pas signes et le relais refusera les allocations — reglez
 	// NPLN_TURN_SECRET sur le meme secret que votre coturn (« static-auth-secret »).
 	turnSecret = envOr("NPLN_TURN_SECRET", "")
-	// 1 = instant solo match (for protocol testing); 8 = a real regular battle room.
-	matchSize = envInt("NPLN_MATCH_SIZE", 1)
-
-	// [Nextendo] Drapeau a chaud « mmsolo » : former le match des qu'UN joueur attend.
-	// Sert quand on teste sans second joueur — la mesure visee (le SNI presente a l'hote de
-	// session) se produit des le SUCCEEDED, un seul client suffit a la produire.
-	if soirFlag("mmsolo") {
-		matchSize = 1
-	}
-
-	// [Nextendo] Drapeau a chaud « mmtaille=<n> » : nombre de joueurs distincts a reunir avant de
-	// former UNE partie.
-	//
-	// Mesure du 2026-08-14 : avec le seuil a 2, quatre joueurs en recherche donnaient DEUX parties
-	// de deux au lieu d'un seul groupe — visible directement dans le monitoring. Or Splatoon 3
-	// verifie l'effectif dans son propre binaire et refuse de lancer une Guerre de territoire a
-	// moins de huit ; apparier par paires ne mene donc nulle part. Le seuil se regle a chaud pour
-	// suivre le nombre de testeurs reellement presents.
-	if v := soirFlagValeur("mmtaille"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			matchSize = int32(n)
-		}
-	}
+	// Le matchmaking de production attend la capacite complete du mode. Les anciens drapeaux de
+	// test mmsolo/mmtaille pouvaient renvoyer une session annoncee pleine mais avec un roster partiel.
+	matchSize = envInt("NPLN_MATCH_SIZE", 8)
 	latencyHost = envOr("NPLN_LATENCY_HOST", "127.0.0.1")
 	return
 }
@@ -487,7 +467,7 @@ func buildHostSession(gsName string, reqGs *mmpb.GameSession, cfg string) *mmpb.
 func (g *gameSessionServer) CreateGameSessionCreationTicket(ctx context.Context, req *mmpb.CreateGameSessionCreationTicketRequest) (*mmpb.GameSessionCreationTicket, error) {
 	// DIAG: dump the FULL request so we mirror exactly the GameSession fields MPJ
 	// populates (hence expects back). Remove once the create-room flow is settled.
-	log.Printf("[NPLN MM][DIAG] CreateGameSessionCreationTicket request =\n%s", prototext.Format(req))
+	debugLogf("[NPLN MM][DIAG] CreateGameSessionCreationTicket request =\n%s", prototext.Format(req))
 	tn := tenantFromCtx(ctx)
 	in := req.GetGameSessionCreationTicket()
 	ticketName := tn + "/gameSessionCreationTickets/" + uuid4()
@@ -610,7 +590,7 @@ func (g *gameSessionServer) CreateGameSessionCreationTicket(ctx context.Context,
 	}
 
 	tok := t.GetMatchedUserSessions()[0].GetMatchmakingIdToken()
-	log.Printf("[NPLN MM][DIAG] session token parts=%d head=%.16s", strings.Count(tok, ".")+1, tok)
+	debugLogf("[NPLN MM][DIAG] session token parts=%d head=%.16s", strings.Count(tok, ".")+1, tok)
 	log.Printf("[NPLN MM] CreateGameSessionCreationTicket host=%q -> ticket=%s (PENDING) session=%s @ %s:%d",
 		short(hostUd.GetUser()), ticketName, gsName, room.GetHost(), room.GetPort())
 	return pending, nil
@@ -1386,26 +1366,9 @@ func (m *matchmakerServer) configsEnAttenteLocked() []string {
 	return out
 }
 
-// seuilPourConfig rend l'effectif a reunir pour CE mode : la capacite de la configuration, et non un
-// nombre unique pour tout le serveur. Un drapeau a chaud pose explicitement reste prioritaire pour les
-// tests a effectif reduit.
+// seuilPourConfig rend l'effectif complet a reunir pour CE mode.
 func seuilPourConfig(cfg string, defaut int32) int32 {
-	// Seuil PAR MODE, pose a chaud : « mmtaille_coop_regular_config=1 » permet d'eprouver la chaine
-	// Salmon Run a un seul joueur sans toucher au Turf, qui doit rester a huit pour les autres.
-	// Un seuil global baisse pour tester un mode cassait tous les autres en meme temps.
-	if v := soirFlagValeur("mmtaille_" + lastSeg(cfg)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return int32(n)
-		}
-	}
-	if soirFlag("mmsolo") {
-		return 1
-	}
-	if v := soirFlagValeur("mmtaille"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return int32(n)
-		}
-	}
+	// No runtime/test flag may reduce a public match below its real mode capacity.
 	return s3RoomCapacity(cfg, defaut)
 }
 
@@ -1418,10 +1381,17 @@ func newMatchmaker() *matchmakerServer {
 func (m *matchmakerServer) formMatchLocked(cfg string, relayHost string, relayPort int32) {
 	players := m.waitersForConfigLocked(cfg)
 
-	// Ne jamais verser plus de joueurs que la configuration n'en accepte : une session annoncee pour
-	// huit qui en recoit douze decrit une partie que le jeu ne peut pas lancer. Le surplus reste en
-	// file et formera le salon suivant.
-	seuilConfig := seuilPourConfig(cfg, int32(len(players)))
+	// Ne jamais former une session partielle annoncee comme pleine. A mismatch here used to produce
+	// GameSession 8/8 while only six or four live users had a matched user session; clients then
+	// observed missing players/disconnects. Leave everyone in this mode's existing queue until the
+	// complete roster is available.
+	_, _, _, _, _, _, _, tailleNominale, _ := mmConfig()
+	seuilConfig := seuilPourConfig(cfg, tailleNominale)
+	if int32(len(players)) < seuilConfig {
+		log.Printf("[NPLN MM] file %s incomplete (%d/%d); keeping players queued", cfg, len(players), seuilConfig)
+		return
+	}
+	// Any surplus stays queued and forms the next complete session.
 
 	// ⚠️ SUR UNE FILE DE FETE, REPARTIR AVANT DE COUPER.
 	//
@@ -1580,9 +1550,10 @@ func (m *matchmakerServer) formMatchLocked(cfg string, relayHost string, relayPo
 		t.MatchedUserSessions = []*mmpb.MatchedUserSession{{
 			UserDefinition: ud,
 			UserSession:    userSess,
-			MatchmakingIdToken: mintGssMatchToken(
+			MatchmakingIdToken: mintGssMatchTokenWithRoute(
 				uid, npnTenant, gsName, userSess, team,
-				gamesyncAttrJSON(ud.GetAttributes()), gamesyncLtcyJSON(ud.GetLatencyData())),
+				gamesyncAttrJSON(ud.GetAttributes()), gamesyncLtcyJSON(ud.GetLatencyData()),
+				gssSessionRoute{Config: baseConfigName(cfgDemandee), Host: relayHost, Port: relayPort}),
 		}}
 		t.GameSession = session
 
@@ -1771,13 +1742,8 @@ func (m *matchmakerServer) TrackMatchmakingTicket(req *mmpb.TrackMatchmakingTick
 
 		log.Printf("[NPLN MM] %s en file (%d/%d joueur(s) distinct(s) en %s, uid=%s)", name, queued, seuil, cfgAttendue, w.uid)
 
-		// RE-EVALUER LE SEUIL PENDANT L'ATTENTE.
-		//
-		// Le seuil n'etait consulte qu'a l'insertion d'un ticket : une fois les joueurs gares dans la
-		// boucle ci-dessous, plus personne ne recomptait. Mesure du 2026-08-15 : deux joueurs en file
-		// (2/8), seuil abaisse a 2 par « mmtaille », et rien ne s'est produit pendant quatre minutes —
-		// il aurait fallu qu'un troisieme ticket arrive pour declencher le comptage. Un drapeau a
-		// chaud qui n'agit qu'au prochain evenement n'est pas un drapeau a chaud.
+		// Recheck the fixed mode target while waiting. A full group can arrive on another listener
+		// after this ticket was enqueued; age never lowers the required roster size.
 		revision := time.NewTicker(2 * time.Second)
 		defer revision.Stop()
 
@@ -1793,8 +1759,7 @@ func (m *matchmakerServer) TrackMatchmakingTicket(req *mmpb.TrackMatchmakingTick
 					nominal := seuilPourConfig(cfg, tailleCourante)
 					// Le seuil se DETEND avec l'attente : exiger huit joueurs simultanes dans une
 					// population qui en reunit cinq, c'est garantir que personne ne joue.
-					seuil, attente := m.seuilCourantLocked(cfg, nominal)
-					journaliserAssouplissement(cfg, nominal, seuil, attente)
+					seuil, _ := m.seuilCourantLocked(cfg, nominal)
 					if int32(n) >= seuil {
 						log.Printf("[NPLN MM] seuil atteint pendant l'attente (%d/%d en %s) -> formation de la partie", n, seuil, cfg)
 						m.formMatchLocked(cfg, relayHost, relayPort)
@@ -1834,14 +1799,14 @@ func (m *matchmakerServer) TrackMatchmakingTicket(req *mmpb.TrackMatchmakingTick
 				}
 				marquerChamp9(final)
 				if soirFlag("dumpsucceeded") {
-					log.Print("[NPLN MM][DIAG] NOTRE SUCCEEDED =\n" + prototext.Format(final))
+					debugLogf("%s", "[NPLN MM][DIAG] NOTRE SUCCEEDED =\n"+prototext.Format(final))
 				}
 				// Octets REELS du message, pour un diff au fil avec captured/TrackMatchmakingTicket.bin.
 				// Le prototext masque l'ordre des champs, les zeros explicites et les champs inconnus :
 				// deux messages qui s'impriment pareil peuvent se serialiser differemment.
 				if soirFlag("hexsucceeded") {
 					if brut, err := proto.Marshal(final); err == nil {
-						log.Printf("[NPLN MM][DIAG] SUCCEEDED brut %d o = %x", len(brut), brut)
+						debugLogf("[NPLN MM][DIAG] SUCCEEDED brut %d o = %x", len(brut), brut)
 					}
 				}
 				log.Printf("[NPLN MM] %s -> SUCCEEDED (session %s : %d/%d annonces, %d session(s) utilisateur pour moi)",

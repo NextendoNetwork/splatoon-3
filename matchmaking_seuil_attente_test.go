@@ -13,37 +13,28 @@ import (
 	mmpb "npln.nintendo.net/npln-practice/proto/matchmaking/v1"
 )
 
-func TestSeuilSeDetendAvecLAttente(t *testing.T) {
-	cas := []struct {
-		attente  time.Duration
-		attendu  int32
-		pourquoi string
-	}{
-		{0, 8, "au depart on vise une partie PLEINE"},
-		{44 * time.Second, 8, "avant 45 s, rien ne bouge"},
-		{45 * time.Second, 6, "premier palier : trois quarts"},
-		{89 * time.Second, 6, "toujours au premier palier"},
-		{90 * time.Second, 4, "second palier : la moitie"},
-		{10 * time.Minute, 4, "on ne descend JAMAIS sous la moitie"},
-	}
-	for _, c := range cas {
-		if got := seuilAssoupli(8, c.attente); got != c.attendu {
-			t.Errorf("attente %s : seuil %d, attendu %d — %s", c.attente, got, c.attendu, c.pourquoi)
+func TestSeuilResteNominalPendantTouteLAttente(t *testing.T) {
+	for _, age := range []time.Duration{0, 45 * time.Second, 2 * time.Minute, 10 * time.Minute} {
+		m := fileDeTest("regular_match_config", 3, age)
+		if got, _ := m.seuilCourantLocked("regular_match_config", 8); got != 8 {
+			t.Errorf("after %s, regular threshold = %d, want 8", age, got)
 		}
 	}
 }
 
-func TestPlancherDuSeuil(t *testing.T) {
-	// Salmon Run : nominal 4, donc plancher 2.
-	if got := seuilAssoupli(4, 10*time.Minute); got != 2 {
-		t.Errorf("coop : seuil %d, attendu 2", got)
-	}
-	// Une session d un seul joueur fait echouer S3 en 2321-3072 : jamais moins de deux.
-	if got := seuilAssoupli(2, 10*time.Minute); got != 2 {
-		t.Errorf("nominal 2 : seuil %d, attendu 2 — jamais de session solo", got)
-	}
-	if got := seuilAssoupli(1, 10*time.Minute); got != 1 {
-		t.Errorf("nominal 1 (essai deliberé) : seuil %d, attendu 1", got)
+func TestSeuilConserveCapaciteNominaleParMode(t *testing.T) {
+	for _, tc := range []struct {
+		config  string
+		nominal int32
+	}{
+		{"regular_match_config", 8},
+		{"coop_regular_config", 4},
+		{"two_player_config", 2},
+	} {
+		m := fileDeTest(tc.config, 1, 10*time.Minute)
+		if got, _ := m.seuilCourantLocked(tc.config, tc.nominal); got != tc.nominal {
+			t.Errorf("%s threshold = %d, want nominal %d", tc.config, got, tc.nominal)
+		}
 	}
 }
 

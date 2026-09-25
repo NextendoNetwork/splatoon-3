@@ -46,6 +46,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
@@ -65,6 +66,7 @@ type gsSessionInfo struct {
 	uid      string // "u-…" (host's NPLN user id) — the UserSession.uid the host matches on
 	gsName   string // tenants/…/gameSessions/<uuid>
 	gsid     string // <uuid> (last segment of gsName) — GameSessionMutableData.gsid
+	config   string // base matchmaking config, bridged in the signed ticket from the matchmaker
 	host     string // relay host (addr)
 	port     int    // relay port (p)
 	maxp     int    // max participants (maxu)
@@ -374,6 +376,30 @@ func enDouble(v *commonpb.Value) *commonpb.Value {
 	return v
 }
 
+func rapportIndiqueDeconnexion(v *commonpb.Value) bool {
+	switch v.GetValueType().(type) {
+	case *commonpb.Value_BooleanValue:
+		return v.GetBooleanValue()
+	case *commonpb.Value_IntegerValue:
+		return v.GetIntegerValue() != 0
+	case *commonpb.Value_DoubleValue:
+		return v.GetDoubleValue() != 0
+	default:
+		return false
+	}
+}
+
+func resultatIndiqueDeconnexion(v *commonpb.Value) bool {
+	switch v.GetValueType().(type) {
+	case *commonpb.Value_IntegerValue:
+		return v.GetIntegerValue() == 2
+	case *commonpb.Value_DoubleValue:
+		return v.GetDoubleValue() == 2
+	default:
+		return false
+	}
+}
+
 // resultatsIndividuels rend la carte `personal_result` du verdict : la fusion des rapports connus
 // pour ce match, completee des champs que seul le serveur produit.
 //
@@ -425,11 +451,14 @@ func resultatsIndividuels(cleMatch string, vainqueur int64, coop bool) (*commonp
 				champs[k] = gsNul()
 			}
 		}
-		if _, deja := champs["deemed_result"]; !deja {
+		if rapportIndiqueDeconnexion(champs["disconnected"]) || resultatIndiqueDeconnexion(champs["deemed_result"]) {
+			// Treat a disconnect as a loss so it does not produce the game's disconnect result.
+			// Always replace result 2, even if this report omitted/cleared `disconnected`; otherwise
+			// a client-supplied disconnect result could still trigger the game's disconnect penalty.
+			champs["deemed_result"] = gsInt(1)
+		} else if _, deja := champs["deemed_result"]; !deja {
 			verdict := int64(1)
 			switch {
-			case champs["disconnected"].GetBooleanValue():
-				verdict = 2
 			case vainqueur != 0 && champs["team"].GetIntegerValue() == vainqueur:
 				verdict = 0
 			}
@@ -745,6 +774,130 @@ func (g *gamesyncServer) gsidPourEcriture(ops []*gspb.WriteOperation) string {
 		g.mu.Unlock()
 	}
 	return ""
+}
+
+func (g *gamesyncServer) sessionPourUID(uid string) (string, string) {
+	if uid == "" {
+		return "", ""
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if info := g.sess[g.lastUss]; info != nil && info.uid == uid {
+		return g.lastUss, info.gsid
+	}
+	var uss string
+	var meilleur *gsSessionInfo
+	for cle, info := range g.sess {
+		if info == nil || info.uid != uid {
+			continue
+		}
+		if meilleur == nil || info.rang > meilleur.rang || info.rang == meilleur.rang && cle < uss {
+			uss = cle
+			meilleur = info
+		}
+	}
+	if meilleur == nil {
+		return "", ""
+	}
+	return uss, meilleur.gsid
+}
+
+func gamesyncIdentityFromCtx(ctx context.Context) (string, string, string) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	for _, authorization := range md.Get("authorization") {
+		authorization = strings.TrimSpace(authorization)
+		authorization = strings.TrimPrefix(strings.TrimPrefix(authorization, "Bearer "), "bearer ")
+		parts := strings.Split(authorization, ".")
+		if len(parts) != 3 || !verifyNplnAccessToken(parts[0], parts[1], parts[2]) {
+			continue
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			continue
+		}
+		var claims struct {
+			Sub string `json:"sub"`
+			Gss struct {
+				GameSession string `json:"game_session"`
+				UserSession string `json:"user_session"`
+			} `json:"gss"`
+			Gamesync struct {
+				GSID string `json:"gsid"`
+				USID string `json:"usid"`
+				UID  string `json:"uid"`
+			} `json:"gamesync"`
+		}
+		if json.Unmarshal(payload, &claims) != nil {
+			continue
+		}
+		uid, uss, gsid := claims.Sub, "", ""
+		if claims.Gss.UserSession != "" {
+			uss = lastSeg(claims.Gss.UserSession)
+			gsid = lastSeg(claims.Gss.GameSession)
+		}
+		if claims.Gamesync.USID != "" {
+			uss = claims.Gamesync.USID
+		}
+		if claims.Gamesync.GSID != "" {
+			gsid = claims.Gamesync.GSID
+		}
+		if claims.Gamesync.UID != "" {
+			uid = claims.Gamesync.UID
+		}
+		if uss != "" || uid != "" {
+			return uid, uss, gsid
+		}
+	}
+	return "", "", ""
+}
+
+func (g *gamesyncServer) contexteEcriture(ctx context.Context, ops []*gspb.WriteOperation) (string, string) {
+	uss := ussFromOps(ops)
+	gsid := g.gsidPourEcriture(ops)
+	uid, tokenUss, tokenGsid := gamesyncIdentityFromCtx(ctx)
+	if tokenUss != "" {
+		g.mu.Lock()
+		info := g.sess[tokenUss]
+		g.mu.Unlock()
+		if info != nil {
+			uss = tokenUss
+			if gsid == "" {
+				gsid = info.gsid
+			}
+		}
+	}
+	if uid == "" {
+		uid = uidFromCtx(ctx)
+	}
+	if uss != "" {
+		g.mu.Lock()
+		info := g.sess[uss]
+		g.mu.Unlock()
+		if info != nil {
+			if gsid == "" {
+				gsid = info.gsid
+			}
+			return uss, gsid
+		}
+		if session, partie := g.sessionPourUID(uss); session != "" {
+			uss = session
+			if gsid == "" {
+				gsid = partie
+			}
+		}
+	}
+	if session, partie := g.sessionPourUID(uid); session != "" {
+		if uss == "" {
+			uss = session
+		}
+		if gsid == "" {
+			gsid = partie
+		}
+	}
+	if gsid == "" {
+		gsid = tokenGsid
+	}
+	return uss, gsid
 }
 
 // uidsDansOps rend les identifiants de compte (« u-… ») cites par les documents ecrits.
@@ -1164,7 +1317,10 @@ func gameSessionMutableFieldsN(info *gsSessionInfo, effectif int) *commonpb.MapV
 			maxp = info.maxp
 		}
 		password, isPublic = info.password, info.isPublic
-		mcn = roomConfigFor(info.gsid)
+		mcn = info.config
+		if mcn == "" {
+			mcn = roomConfigFor(info.gsid)
+		}
 	}
 	return &commonpb.MapValue{Fields: map[string]*commonpb.Value{
 		"gsid": gsStr(gsid),
@@ -1237,7 +1393,10 @@ func (g *gamesyncServer) champsGs(sous string, info *gsSessionInfo, effectif int
 	var prp *commonpb.MapValue
 	if info != nil {
 		gsid, addr, port = info.gsid, info.host, info.port
-		mcn = roomConfigFor(info.gsid)
+		mcn = info.config
+		if mcn == "" {
+			mcn = roomConfigFor(info.gsid)
+		}
 		password, _, _ = roomSettingsFor(info.gsid)
 		prp = proprietesSalon(info.gsid)
 	}
@@ -1332,13 +1491,18 @@ func (g *gamesyncServer) champsGs(sous string, info *gsSessionInfo, effectif int
 // (an ES256 JWT minted by CreateGameSessionCreationTicket). We only READ claims here (no verify
 // — it's our own token), so a plain base64 payload decode is enough.
 func decodeSessionToken(tok string) (uid, gsName string) {
+	uid, gsName, _ = decodeSessionTokenWithRoute(tok)
+	return uid, gsName
+}
+
+func decodeSessionTokenWithRoute(tok string) (uid, gsName string, route gssSessionRoute) {
 	parts := strings.Split(tok, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return "", "", route
 	}
 	pb, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", ""
+		return "", "", route
 	}
 	var m struct {
 		Sub string `json:"sub"`
@@ -1349,6 +1513,9 @@ func decodeSessionToken(tok string) (uid, gsName string) {
 			USID string `json:"usid"`
 			UID  string `json:"uid"`
 			TID  string `json:"tid"`
+			MCN  string `json:"mcn"`
+			Host string `json:"relay_host"`
+			Port int32  `json:"relay_port"`
 		} `json:"gamesync"`
 		// Our former shape, kept so a token minted before this change still resolves.
 		Gss struct {
@@ -1357,9 +1524,10 @@ func decodeSessionToken(tok string) (uid, gsName string) {
 		} `json:"gss"`
 	}
 	if json.Unmarshal(pb, &m) != nil {
-		return "", ""
+		return "", "", route
 	}
 	if g := m.Gamesync; g.GSID != "" {
+		route = gssSessionRoute{Config: g.MCN, Host: g.Host, Port: g.Port}
 		uid = g.UID
 		if uid == "" {
 			uid = m.Sub
@@ -1369,9 +1537,9 @@ func decodeSessionToken(tok string) (uid, gsName string) {
 		if tid == "" {
 			tid = strings.TrimPrefix(npnTenant, "tenants/")
 		}
-		return uid, "tenants/" + tid + "/gameSessions/" + g.GSID
+		return uid, "tenants/" + tid + "/gameSessions/" + g.GSID, route
 	}
-	return m.Sub, m.Gss.GameSession
+	return m.Sub, m.Gss.GameSession, route
 }
 
 // participantsDeLaPartie rend les userSession (uuid -> info) qui partagent le MEME gameSession que
@@ -1561,19 +1729,35 @@ func (g *gamesyncServer) IssueToken(ctx context.Context, req *gspb.IssueTokenReq
 		}
 		g.mu.Unlock()
 	}
-	uid, gsName := decodeSessionToken(req.GetMatchmakingIdToken())
+	uid, gsName, route := decodeSessionTokenWithRoute(req.GetMatchmakingIdToken())
 	relayHost, relayPort, _, _, _, _, _, _, _ := mmConfig()
+	if route.Host != "" {
+		relayHost = route.Host
+	}
+	if route.Port > 0 {
+		relayPort = route.Port
+	}
+	gsid := lastSeg(gsName)
+	config := route.Config
+	if config == "" {
+		config = roomConfigFor(gsid)
+	}
+	// Rebuild the matchmaker's process-local settings from the signed ticket. The 443
+	// matchmaker and this :7575 listener are separate processes, so its roomSettingsByGsid
+	// map is otherwise empty here; that left mcn blank in the session documents.
+	if config != "" {
+		rememberRoomSettings(gsid, "", true, config, nil)
+	}
 	info := &gsSessionInfo{
 		uid:    uid,
 		gsName: gsName,
-		gsid:   lastSeg(gsName),
+		gsid:   gsid,
+		config: config,
 		host:   relayHost,
 		port:   int(relayPort),
-		// Capacite REELLE du mode, au lieu d'un 4 fige : une Guerre de territoire se joue a 8,
-		// un salon prive a 10, le Salmon Run a 4. Le nom de configuration arrive par le pont
-		// roomSettingsByGsid, alimente par les DEUX chemins de session (ticket de creation et
-		// matchmaking). Sans lui, le jeu voyait maxu=4 pour une Turf.
-		maxp:     int(s3RoomCapacity(roomConfigFor(lastSeg(gsName)), 8)),
+		// The signed ticket carries the config so the separate process can give the session its
+		// real capacity and mode, rather than falling back to an empty config.
+		maxp:     int(s3RoomCapacity(config, 8)),
 		isPublic: true, // default: public/no-password (overridden below if the room set one)
 	}
 	if pw, pub, ok := roomSettingsFor(info.gsid); ok {
@@ -1620,7 +1804,8 @@ func (g *gamesyncServer) IssueToken(ctx context.Context, req *gspb.IssueTokenReq
 	g.last = info
 	g.lastUss = uss
 	g.mu.Unlock()
-	log.Printf("[NPLN gamesync] IssueToken cached session uss=%s uid=%s gsid=%s relay=%s:%d", uss, info.uid, info.gsid, info.host, info.port)
+	log.Printf("[NPLN gamesync] IssueToken cached session uss=%s uid=%s gsid=%s config=%s maxp=%d relay=%s:%d",
+		uss, info.uid, info.gsid, info.config, info.maxp, info.host, info.port)
 
 	return &gspb.IssueTokenResponse{Token: g.issueToken(req.GetUserSession())}, nil
 }
@@ -2136,7 +2321,7 @@ func (g *gamesyncServer) KeepUserSession(stream grpc.BidiStreamingServer[gspb.Ke
 			log.Printf("[NPLN gamesync] KeepUserSession recv err: %v", err)
 			return err
 		}
-		log.Printf("[NPLN gamesync][DIAG] KeepUserSession req =\n%s", prototext.Format(req))
+		debugLogf("[NPLN gamesync][DIAG] KeepUserSession req =\n%s", prototext.Format(req))
 
 		if echo := req.GetEcho(); echo != "" {
 			if err := send(&gspb.KeepUserSessionResponse{
@@ -2518,14 +2703,13 @@ func opDesc(ops []*gspb.WriteOperation) string {
 
 func (g *gamesyncServer) WriteDocuments(ctx context.Context, req *gspb.WriteDocumentsRequest) (*gspb.WriteDocumentsResponse, error) {
 	ops := req.GetWriteOperations()
-	uss := ussFromOps(ops)
+	uss, gsid := g.contexteEcriture(ctx, ops)
 	// La partie AVANT le journal, pas apres. Sans elle, une ecriture ne se rattache a rien : le
 	// 2026-08-21, pour savoir si les salons qui meurent publient leurs reglages (docs/__gs/m), il a
 	// fallu passer par les IP du journal TURN et une fenetre de quinze minutes — attribution
 	// approximative, et les parties se chevauchent. gsid etait pourtant deja calcule juste en
 	// dessous. On le nomme « partie= », comme les lignes de lecture de l'arbitre, pour que les deux
 	// bouts d'une meme partie se recoupent d'un simple filtre.
-	gsid := g.gsidPourEcriture(ops)
 	log.Printf("[NPLN gamesync] WriteDocuments ops=%d [%s] closing=%v partie=%s uss=%s",
 		len(ops), opDesc(ops), g.isClosing(uss), gsid, uss)
 	// Ce que les consoles disent de LEURS liens P2P. Elles l ecrivent depuis toujours dans
@@ -2569,9 +2753,8 @@ func (g *gamesyncServer) BeginTransaction(ctx context.Context, req *gspb.BeginTr
 
 func (g *gamesyncServer) CommitTransaction(ctx context.Context, req *gspb.CommitTransactionRequest) (*gspb.CommitTransactionResponse, error) {
 	ops := req.GetWriteOperations()
-	uss := ussFromOps(ops)
+	uss, gsid := g.contexteEcriture(ctx, ops)
 	log.Printf("[NPLN gamesync] CommitTransaction ops=%d", len(ops))
-	gsid := g.gsidPourEcriture(ops)
 	g.mu.Lock()
 	g.applyWritesToStore(gsid, ops)
 	g.mu.Unlock()

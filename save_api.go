@@ -87,12 +87,16 @@ func handleSaveRecord(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt: info.ModTime().UTC().Format("2006-01-02T15:04:05Z"),
 	}
 
-	if rec := recordStore.snapshot(acc.UserID); rec != nil {
+	if rec, err := recordStore.snapshot(acc.UserID); err == nil && rec != nil {
 		d := rec.GetSaveData()
 		view.Keys = len(d.GetFields())
 		view.UserName = strField(d, "UserName")
 		view.Level = intField(d, "PlayerRank")
 		view.Money = intField(d, "Money")
+	} else if err != nil {
+		log.Printf("[NPLN save-api] pid=%d: save could not be read: %v", pid, err)
+		http.Error(w, "save unavailable", http.StatusServiceUnavailable)
+		return
 	}
 
 	writeSaveJSON(w, view)

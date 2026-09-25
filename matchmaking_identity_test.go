@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,7 +49,7 @@ func gssClaims(t *testing.T, tok string) map[string]any {
 func TestSucceededTicketCarriesEachPlayersOwnIdentity(t *testing.T) {
 	t.Setenv("NPLN_JWT_KEY", filepath.Join(t.TempDir(), "test_es256.key"))
 
-	// Deux joueurs distincts, chacun avec la user definition que S3 envoie réellement : l'ALIAS
+	// Huit joueurs distincts, chacun avec la user definition que S3 envoie réellement : l'ALIAS
 	// déjà résolu vers le user concret par CreateMatchmakingTicket.
 	mk := func(uid string, ms int32) *mmWaiter {
 		return &mmWaiter{
@@ -69,17 +70,20 @@ func TestSucceededTicketCarriesEachPlayersOwnIdentity(t *testing.T) {
 		}
 	}
 
-	a := mk("u-exemple1000000000000", 30)
-	b := mk("u-exemple4000000000000", 40)
+	players := make([]*mmWaiter, 0, 8)
+	for i := 0; i < 8; i++ {
+		players = append(players, mk(fmt.Sprintf("u-exemple%016d", i+1), int32(30+i)))
+	}
+	a, b := players[0], players[1]
 
 	m := newMatchmaker()
 	m.mu.Lock()
-	m.waiting = []*mmWaiter{a, b}
+	m.waiting = players
 	m.formMatchLocked("regular_match_config", "203.0.113.7", 7575)
 	m.mu.Unlock()
 
 	var gs string
-	for _, w := range []*mmWaiter{a, b} {
+	for _, w := range players {
 		var got *mmpb.MatchmakingTicket
 		select {
 		case got = <-w.out:

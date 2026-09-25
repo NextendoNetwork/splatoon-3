@@ -169,7 +169,6 @@ func (s *friendsServer) SubscribeFriendUsers(req *friendspb.SubscribeFriendUsers
 		<-ctx.Done()
 		return nil
 	}
-
 	if me, err := accountFriends(pid); err != nil {
 		log.Printf("[NPLN Friends] Subscribe pid=%d: %v -> captured fallback friend list", pid, err)
 		if resp, cok := capturedSubscribeFriendUsers(); cok {
@@ -263,6 +262,18 @@ func (s *friendsServer) SubscribeFriendUsers(req *friendspb.SubscribeFriendUsers
 				pid, (len(accounts)+n-1)/n, n)
 		} else {
 			_ = stream.Send(plein)
+		}
+		keepalive := time.NewTicker(nplnStreamHeartbeat)
+		defer keepalive.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-keepalive.C:
+				if err := stream.Send(&friendspb.SubscribeFriendUsersResponse{KeepAliveInterval: ka}); err != nil {
+					return nil
+				}
+			}
 		}
 	}
 

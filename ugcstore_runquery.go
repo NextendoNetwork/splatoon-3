@@ -24,13 +24,14 @@ package main
 // a read_time seul d'avant : c'est mesure, et le compte neuf en depend.
 
 import (
+	"bytes"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -58,7 +59,13 @@ func cheminDeDocument(nom string) string {
 // tete — ce que le jeu demande en triant sur « started_at ».
 func documentsSousParent(parent string) []*ugcpb.Document {
 	relireLesNouveauxDocuments()
+	return documentsSousParentEnMemoire(parent)
+}
 
+// documentsSousParentEnMemoire searches the already-loaded store without disk I/O. The locker and
+// deck listings are written by this NPLN process itself, so they do not need the cross-process
+// refresh used for GameSync-created match records.
+func documentsSousParentEnMemoire(parent string) []*ugcpb.Document {
 	prefixe := cheminDeDocument(strings.TrimSuffix(parent, "/")) + "/"
 
 	documentStore.mu.RLock()
@@ -123,59 +130,86 @@ func (u *ugcstoreServer) RunQuery(req *ugcpb.RunQueryRequest, stream grpc.Server
 	return nil
 }
 
-// ---- relecture du disque avant d'enumerer ---------------------------------------------------
+// ---- rafraichissement interprocessus ---------------------------------------------------------
 //
-// ⚠️ LE PIEGE DES DEUX PROCESSUS. C'est l'ARBITRE (gamesync, systemd) qui cree le document de
-// bataille a la fin du match, et c'est le CONTENEUR (port 443) qui repond au RunQuery de la console.
-// Deux processus, deux magasins en memoire. Le conteneur ne charge le disque qu'au demarrage : sans
-// relecture, il n'apprendrait l'existence d'une bataille qu'au prochain redemarrage du serveur, et
-// l'historique resterait vide exactement comme avant.
-//
-// On ne relit pas a chaque appel pour autant : on regarde la date du DOSSIER, qui change des qu'un
-// document y est ajoute. Tant qu'elle ne bouge pas, la memoire fait foi.
+// L'arbitre GameSync et le serveur NPLN ont des magasins en memoire distincts, mais partagent le
+// dossier disque. Le journal changes.index indique au serveur NPLN les seuls fichiers modifies
+// depuis sa derniere lecture, au lieu de relire tous les documents a chaque changement du dossier.
 
 var derniereRelecture struct {
 	sync.Mutex
-	vue time.Time
+	offset      int64
+	initialisee bool
 }
 
-// relireLesNouveauxDocuments charge depuis le disque ce que la memoire ignore encore.
+// relireLesNouveauxDocuments consumes the append-only journal of documents written by the sibling
+// process. The complete directory is loaded once at startup; runtime refreshes read only changed
+// document files instead of rescanning and unmarshalling thousands of unchanged files.
 func relireLesNouveauxDocuments() {
-	fi, err := os.Stat(documentsDir())
+	fi, err := os.Stat(documentChangesPath())
 	if err != nil {
 		return
 	}
 
 	derniereRelecture.Lock()
-	if !fi.ModTime().After(derniereRelecture.vue) {
+	if !derniereRelecture.initialisee {
+		// Tests and callers that have not run chargerDocuments start at the journal beginning.
+		derniereRelecture.initialisee = true
+	}
+	if fi.Size() <= derniereRelecture.offset {
 		derniereRelecture.Unlock()
 		return
 	}
-	derniereRelecture.vue = fi.ModTime()
-	derniereRelecture.Unlock()
 
-	entrees, err := os.ReadDir(documentsDir())
+	debut := derniereRelecture.offset
+	f, err := os.Open(documentChangesPath())
 	if err != nil {
+		derniereRelecture.Unlock()
 		return
 	}
-	n := 0
-	for _, e := range entrees {
-		b, err := os.ReadFile(filepath.Join(documentsDir(), e.Name()))
+	if _, err := f.Seek(debut, io.SeekStart); err != nil {
+		_ = f.Close()
+		derniereRelecture.Unlock()
+		return
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, fi.Size()-debut))
+	_ = f.Close()
+	if readErr != nil {
+		derniereRelecture.Unlock()
+		return
+	}
+	// Ignore a trailing partial line if another process is appending at the same time; it will
+	// be consumed on the next call once its newline has been written.
+	lastNewline := bytes.LastIndexByte(data, '\n')
+	if lastNewline < 0 {
+		derniereRelecture.Unlock()
+		return
+	}
+	consumed := data[:lastNewline+1]
+	loaded := 0
+	for _, key := range strings.Split(string(consumed), "\n") {
+		if len(key) != 40 {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(documentsDir(), key+".pb"))
 		if err != nil {
+			log.Printf("[NPLN ugcstore] document journalise %s illisible : %v", key, err)
 			continue
 		}
 		doc := &ugcpb.Document{}
-		if proto.Unmarshal(b, doc) != nil || doc.GetName() == "" {
+		if err := proto.Unmarshal(b, doc); err != nil || doc.GetName() == "" {
+			log.Printf("[NPLN ugcstore] document journalise %s invalide", key)
 			continue
 		}
 		documentStore.mu.Lock()
-		if _, deja := documentStore.docs[doc.GetName()]; !deja {
-			documentStore.docs[doc.GetName()] = doc
-			n++
-		}
+		// Replace too: the sibling may have updated an existing record, not just created one.
+		documentStore.docs[doc.GetName()] = doc
 		documentStore.mu.Unlock()
+		loaded++
 	}
-	if n > 0 {
-		log.Printf("[NPLN ugcstore] %d document(s) neuf(s) relus depuis le disque (ecrits par l'autre processus)", n)
+	derniereRelecture.offset += int64(len(consumed))
+	derniereRelecture.Unlock()
+	if loaded > 0 {
+		log.Printf("[NPLN ugcstore] %d document(s) changes relus depuis le journal", loaded)
 	}
 }

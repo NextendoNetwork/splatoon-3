@@ -267,7 +267,20 @@ func mintSessionToken(uid, tenant, gsName, userSess string) string {
 // gsid = game-session id, ltcy = per-region latencies JSON, usid = user-session id, tid/typ/uid/team).
 // The old opaque "nextendo-gss.<b64>" failed the client's JWT parse; this decodes+verifies via our
 // jku/kid (jwks.go). attrJSON/ltcyJSON are built by the caller from the ticket's UserDefinition.
+// gssSessionRoute carries the public match's authoritative GameSync settings across the
+// matchmaker/GameSync process boundary. The matchmaker and the :7575 listener run separately,
+// so their in-memory room settings are not shared.
+type gssSessionRoute struct {
+	Config string
+	Host   string
+	Port   int32
+}
+
 func mintGssMatchToken(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON string) string {
+	return mintGssMatchTokenWithRoute(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON, gssSessionRoute{})
+}
+
+func mintGssMatchTokenWithRoute(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON string, route gssSessionRoute) string {
 	key, kid := nplnSigningKey()
 	if key == nil {
 		return "nextendo-gss.fallback"
@@ -291,21 +304,33 @@ func mintGssMatchToken(uid, tenant, gsName, userSess, team, attrJSON, ltcyJSON s
 	// en-tête à DEUX membres — {"alg":"ES256","kid":"754fe17e-…"} — sans `jku`, et une durée de vie
 	// d'une heure (exp 1786143269 − iat 1786139669 = 3600). Nous ajoutions `jku` et signions pour 8 h.
 	header := map[string]any{"alg": "ES256", "kid": kid}
+	gamesync := map[string]any{
+		"attr": attrJSON,
+		"gsid": gsid,
+		"ltcy": ltcyJSON,
+		"team": team,
+		"tid":  tid,
+		"typ":  1,
+		"uid":  uid,
+		"usid": usid,
+	}
+	// These claims are consumed only by our GameSync listener. They let its separate process
+	// reconstruct the exact mode and endpoint that the matchmaker returned to the client.
+	if route.Config != "" {
+		gamesync["mcn"] = route.Config
+	}
+	if route.Host != "" {
+		gamesync["relay_host"] = route.Host
+	}
+	if route.Port > 0 {
+		gamesync["relay_port"] = route.Port
+	}
 	payload := map[string]any{
-		"exp": now.Add(gssTokenTTL).Unix(),
-		"iat": now.Unix(),
-		"iss": "gss",
-		"sub": uid,
-		"gamesync": map[string]any{
-			"attr": attrJSON,
-			"gsid": gsid,
-			"ltcy": ltcyJSON,
-			"team": team,
-			"tid":  tid,
-			"typ":  1,
-			"uid":  uid,
-			"usid": usid,
-		},
+		"exp":      now.Add(gssTokenTTL).Unix(),
+		"iat":      now.Unix(),
+		"iss":      "gss",
+		"sub":      uid,
+		"gamesync": gamesync,
 	}
 
 	hj, _ := json.Marshal(header)

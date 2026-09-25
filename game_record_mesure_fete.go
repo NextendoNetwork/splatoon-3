@@ -66,7 +66,12 @@ func repondreMesureDeFete(requete []byte, uid string) ([]byte, error) {
 	}
 
 	if uid != "" && len(uid) == len(captureVierge) {
-		corps = bytes.ReplaceAll(corps, []byte(captureVierge), []byte(uid))
+		corps = motifUid.ReplaceAllFunc(corps, func(found []byte) []byte {
+			if len(found) == len(uid) {
+				return []byte(uid)
+			}
+			return found
+		})
 	}
 
 	fete := feteDeLaRequete(requete)

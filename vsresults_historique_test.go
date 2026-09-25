@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	commonpb "npln.nintendo.net/npln-practice/proto/common"
 	ugcpb "npln.nintendo.net/npln-practice/proto/ugcstore/v1"
@@ -32,9 +31,6 @@ func magasinIsole(t *testing.T) {
 	documentStore.mu.Lock()
 	documentStore.docs = map[string]*ugcpb.Document{}
 	documentStore.mu.Unlock()
-	derniereRelecture.Lock()
-	derniereRelecture.vue = time.Time{}
-	derniereRelecture.Unlock()
 }
 
 const battleDeTest = "20260823T000736_35ddcc57-431a-481d-b04a-8de6e580219b"

@@ -53,6 +53,14 @@ var documentStore = struct {
 	docs map[string]*ugcpb.Document
 }{docs: map[string]*ugcpb.Document{}}
 
+// chargerDocuments runs while constructing each listener (TLS and h2c) in the same process.
+// The directory is shared, but the in-memory store is process-wide, so a second full scan is
+// redundant and can contend with live RPCs while reading thousands of documents.
+var chargementDocuments = struct {
+	sync.Mutex
+	termine bool
+}{}
+
 func storeGetDocument(name string) (*ugcpb.Document, bool) {
 	documentStore.mu.RLock()
 	doc, ok := documentStore.docs[name]
@@ -129,9 +137,36 @@ func storePutDocument(doc *ugcpb.Document) {
 
 func documentsDir() string { return filepath.Join(filepath.Dir(saveDir()), "documents") }
 
-func documentPath(name string) string {
+// documentFileKey is also written to changes.index. Keeping the cross-process journal entries
+// to a fixed-size hash avoids putting user or document paths into the index file.
+func documentFileKey(name string) string {
 	h := sha1.Sum([]byte(name))
-	return filepath.Join(documentsDir(), hex.EncodeToString(h[:])+".pb")
+	return hex.EncodeToString(h[:])
+}
+
+func documentPath(name string) string {
+	return filepath.Join(documentsDir(), documentFileKey(name)+".pb")
+}
+
+func documentChangesPath() string {
+	return filepath.Join(documentsDir(), "changes.index")
+}
+
+// annoncerChangementDocument lets the sibling NPLN process refresh just this document. Previously,
+// every changed directory made RunQuery and the public locker/card listings read and unmarshal the
+// entire document directory (6,566 files in the public log), causing multi-second RPC stalls.
+func annoncerChangementDocument(name string) {
+	f, err := os.OpenFile(documentChangesPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Printf("[NPLN ugcstore] journal des documents : %v", err)
+		return
+	}
+	if _, err := f.Write([]byte(documentFileKey(name) + "\n")); err != nil {
+		log.Printf("[NPLN ugcstore] journal de %q : %v", name, err)
+	}
+	if err := f.Close(); err != nil {
+		log.Printf("[NPLN ugcstore] fermeture du journal de %q : %v", name, err)
+	}
 }
 
 func persisterDocument(doc *ugcpb.Document) {
@@ -146,17 +181,42 @@ func persisterDocument(doc *ugcpb.Document) {
 	}
 	if err := os.WriteFile(documentPath(doc.GetName()), b, 0o644); err != nil {
 		log.Printf("[NPLN ugcstore] ecriture de %q : %v", doc.GetName(), err)
+		return
 	}
+	annoncerChangementDocument(doc.GetName())
 }
 
 // chargerDocuments relit tout ce que les joueurs ont ecrit avant le dernier redemarrage.
 func chargerDocuments() {
+	chargementDocuments.Lock()
+	defer chargementDocuments.Unlock()
+	if chargementDocuments.termine {
+		return
+	}
+
+	// Capture the journal size BEFORE scanning the document directory. Any sibling-process write
+	// racing with the scan then lands after this offset and will be picked up incrementally.
+	derniereRelecture.Lock()
+	if !derniereRelecture.initialisee {
+		if fi, err := os.Stat(documentChangesPath()); err == nil {
+			derniereRelecture.offset = fi.Size()
+		}
+		derniereRelecture.initialisee = true
+	}
+	derniereRelecture.Unlock()
+
 	entrees, err := os.ReadDir(documentsDir())
 	if err != nil {
+		if os.IsNotExist(err) {
+			chargementDocuments.termine = true
+		}
 		return // aucun document encore ecrit : normal au premier demarrage
 	}
 	n := 0
 	for _, e := range entrees {
+		if !strings.HasSuffix(e.Name(), ".pb") {
+			continue
+		}
 		b, err := os.ReadFile(filepath.Join(documentsDir(), e.Name()))
 		if err != nil {
 			continue
@@ -165,9 +225,12 @@ func chargerDocuments() {
 		if proto.Unmarshal(b, doc) != nil || doc.GetName() == "" {
 			continue
 		}
+		documentStore.mu.Lock()
 		documentStore.docs[doc.GetName()] = doc
+		documentStore.mu.Unlock()
 		n++
 	}
+	chargementDocuments.termine = true
 	if n > 0 {
 		log.Printf("[NPLN ugcstore] %d document(s) relus depuis le disque", n)
 	}
@@ -352,9 +415,11 @@ func attributsDeCompte(name string) *ugcpb.Document {
 	//
 	// Tous les identifiants de fete font dix caracteres, donc l'echange se fait octet a octet sans
 	// toucher aux prefixes de longueur — meme procede que pour l'identifiant de compte.
-	aligne := bytes.ReplaceAll(brut, []byte(capturedUserGameRecord), []byte(uid))
-	if fete := identifiantDeFeteMaison(time.Now()); len(fete) == len(feteDesAttributsCaptures) {
-		aligne = bytes.ReplaceAll(aligne, []byte(feteDesAttributsCaptures), []byte(fete))
+	aligne := alignerCompteVierge(brut, uid)
+	if festMaisonActif() {
+		if fete := identifiantDeFeteMaison(time.Now()); len(fete) == len(feteDesAttributsCaptures) {
+			aligne = bytes.ReplaceAll(aligne, []byte(feteDesAttributsCaptures), []byte(fete))
+		}
 	}
 
 	doc := &ugcpb.Document{}

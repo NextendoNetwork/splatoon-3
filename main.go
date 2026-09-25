@@ -49,7 +49,7 @@ func logMetadata(ctx context.Context, method string) {
 	if len(auth) > 24 {
 		auth = auth[:24] + "…"
 	}
-	log.Printf("[NPLN RPC] %s tenant=%q uid=%q auth=%q", method, get("npln-tenant-id"), get("uid"), auth)
+	debugLogf("[NPLN RPC] %s tenant=%q uid=%q auth=%q", method, get("npln-tenant-id"), get("uid"), auth)
 }
 
 // traceInterceptor logs every incoming RPC (method + metadata) so we can see the
@@ -58,15 +58,16 @@ func traceInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, 
 	logMetadata(ctx, info.FullMethod)
 	resp, err := handler(ctx, req)
 	if err != nil {
-		log.Printf("[NPLN RPC] %s -> ERROR %v", info.FullMethod, err)
+		debugLogf("[NPLN RPC] %s -> ERROR %v", info.FullMethod, err)
 	}
 	return resp, err
 }
 
 // buildServer creates a gRPC server with every NPLN service + our hybrid codec,
 // replay handler and tracing. creds == nil yields a PLAINTEXT (h2c) server (used for
-// the Traefik-terminated no-SNI route); otherwise it's TLS.
-func buildServer(creds credentials.TransportCredentials) *grpc.Server {
+// the Traefik-terminated no-SNI route); otherwise it's TLS. When listeners in one
+// process share matchmaking, pass the same matchmaker to each server.
+func buildServer(creds credentials.TransportCredentials, sharedMatchmakers ...*matchmakerServer) *grpc.Server {
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(chaineUnaire(typeGrpcUnaire, traceInterceptor)),
 		// npln-grpc-type sur CHAQUE reponse, comme la passerelle de Nintendo (voir npln_grpc_type.go).
@@ -101,7 +102,11 @@ func buildServer(creds credentials.TransportCredentials) *grpc.Server {
 	// giving "0/4" with no member icon and blocking room-code/invite/end-session. (NPLN_REPLAY_FRIENDS
 	// was a diagnostic override that got stuck ON in the container; it is intentionally ignored now.)
 	friendspb.RegisterFriendsServer(s, &friendsServer{}) // dynamic friend list (precedence over replay)
-	mmpb.RegisterMatchmakerServer(s, newMatchmaker())
+	matchmaker := newMatchmaker()
+	if len(sharedMatchmakers) > 0 && sharedMatchmakers[0] != nil {
+		matchmaker = sharedMatchmakers[0]
+	}
+	mmpb.RegisterMatchmakerServer(s, matchmaker)
 	// ⚠️ GetDocument reste UNAIRE et repond NotFound pour un document absent. Les deux façons
 	// d'imiter le « Succeeded / content-length: 0 » de la capture ont ete essayees et FONT
 	// CRASHER S3 (2162-0001 a 72 s de boot, thread nn.npln.Worker) : un Document vide comme un
@@ -124,6 +129,7 @@ func buildServer(creds credentials.TransportCredentials) *grpc.Server {
 }
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC)
 	addr := envOr("NPLN_LISTEN", ":7443")
 	certFile := envOr("CERT_FILE", `C:\Dev\Dev\reverse eden\server\certs\local_server_cert.pem`)
 	keyFile := envOr("KEY_FILE", `C:\Dev\Dev\reverse eden\server\certs\local_server_key.pem`)
@@ -169,6 +175,10 @@ func main() {
 	// n'atteigne le serveur. Voir frames_diag.go.
 	creds = tracerLesTrames(creds)
 
+	// All gRPC listeners in this process must use the same in-memory matchmaking pool. In particular,
+	// clients routed through TLS/SNI and Traefik's no-SNI h2c listener must be able to match each other.
+	matchmaker := newMatchmaker()
+
 	// GAMESYNC-ONLY mode (runs on the HOST, bound to :7575): the client's Pia/NPLN session
 	// transport connects DIRECTLY to GameSession.Host:Port (203.0.113.7:7575, SNI
 	// gs.nintendo.net) — NOT through Traefik — and calls nn.npln.gamesync.v1.Gamesync. This
@@ -184,10 +194,10 @@ func main() {
 		// counters, so it must not fight the container's listener.
 		go startDashboard(envOr("NPLN_DASH_LISTEN", ":8090"), os.Getenv("DASH_TOKEN"))
 		log.Printf("Nextendo NPLN GAMESYNC server listening on %s (gRPC/TLS, SNI gs.nintendo.net) — session transport", addr)
-		log.Fatal(buildServer(creds).Serve(lis))
+		log.Fatal(buildServer(creds, matchmaker).Serve(lis))
 	}
 
-	s := buildServer(creds) // TLS on :443 (SNI passthrough connections)
+	s := buildServer(creds, matchmaker) // TLS on :443 (SNI passthrough connections)
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -211,11 +221,11 @@ func main() {
 		"nn.npln.toyohr.v1.FestService",
 	}, ", "))
 
-	// h2c (plaintext gRPC) listener for the NO-SNI case. Ryujinx's S3 opens the NPLN
-	// TLS connection WITHOUT an SNI (its bundled OpenSSL doesn't emit one under emulation),
-	// so Traefik can't passthrough-route it (passthrough routes by SNI). Instead Traefik
-	// TLS-terminates the no-SNI connection and forwards the decrypted HTTP/2 here. Same
-	// gRPC server, just without our TLS layer (Traefik already did TLS with S3).
+	// h2c (plaintext gRPC) listener for the NO-SNI case. It uses a separate gRPC server with the
+	// TLS listener's matchmaking pool, so routing differences cannot split players into separate
+	// in-memory queues. Ryujinx's S3 opens the NPLN TLS connection WITHOUT an SNI (its bundled
+	// OpenSSL doesn't emit one under emulation), so Traefik can't passthrough-route it (passthrough
+	// routes by SNI). Instead Traefik terminates TLS and forwards decrypted HTTP/2 here.
 	go func() {
 		h2cLis, e := net.Listen("tcp", envOr("NPLN_H2C_LISTEN", ":8080"))
 		if e != nil {
@@ -223,7 +233,7 @@ func main() {
 			return
 		}
 		log.Printf("NPLN h2c (plaintext gRPC) listening on %s — for Traefik-terminated no-SNI route", h2cLis.Addr())
-		if e := buildServer(nil).Serve(h2cLis); e != nil { // nil creds = plaintext h2c
+		if e := buildServer(nil, matchmaker).Serve(h2cLis); e != nil { // nil creds = plaintext h2c
 			log.Printf("h2c serve: %v", e)
 		}
 	}()

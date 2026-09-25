@@ -22,15 +22,27 @@ package main
 
 import (
 	"context"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 const enteteTypeGrpc = "npln-grpc-type"
 
 // natureDuFlux rend la valeur que Nintendo met dans l'en-tete pour un flux donne.
 func natureDuFlux(info *grpc.StreamServerInfo) string {
+	if info != nil {
+		service, method, ok := strings.Cut(strings.TrimPrefix(info.FullMethod, "/"), "/")
+		if ok {
+			descriptor, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(service + "." + method))
+			if declared, ok := descriptor.(protoreflect.MethodDescriptor); err == nil && ok {
+				info = &grpc.StreamServerInfo{IsClientStream: declared.IsStreamingClient(), IsServerStream: declared.IsStreamingServer()}
+			}
+		}
+	}
 	switch {
 	case info == nil:
 		return "Unary"

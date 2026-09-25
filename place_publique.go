@@ -142,7 +142,7 @@ func documentsDeLaPlace(collection string, plafond int) []*ugcpb.Document {
 		return c.docs
 	}
 
-	docs := documentsSousParent(npnTenant + "/" + collection)
+	docs := documentsSousParentEnMemoire(npnTenant + "/" + collection)
 	if len(docs) > plafond {
 		docs = docs[:plafond]
 	}

@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	toyohrpb "npln.nintendo.net/npln-practice/proto/toyohr/v1"
@@ -93,8 +94,9 @@ const nplnStreamHeartbeat = 20 * time.Second
 // et ce sera une fonctionnalite a part, pas un effet de bord.
 var echosDeHall = struct {
 	sync.Mutex
-	m map[string]chan []byte
-}{m: map[string]chan []byte{}}
+	m       map[string]chan []byte
+	lobbies map[string]string
+}{m: map[string]chan []byte{}, lobbies: map[string]string{}}
 
 // canalDeHall rend le canal d'echo de ce joueur, en le creant au besoin.
 func canalDeHall(uid string) chan []byte {
@@ -112,7 +114,40 @@ func canalDeHall(uid string) chan []byte {
 func oublierCanalDeHall(uid string) {
 	echosDeHall.Lock()
 	delete(echosDeHall.m, uid)
+	delete(echosDeHall.lobbies, uid)
 	echosDeHall.Unlock()
+}
+
+func enregistrerAbonnementLobby(uid, lobby string) chan []byte {
+	echosDeHall.Lock()
+	defer echosDeHall.Unlock()
+	c := echosDeHall.m[uid]
+	if c == nil {
+		c = make(chan []byte, 64)
+		echosDeHall.m[uid] = c
+	}
+	echosDeHall.lobbies[uid] = lobby
+	return c
+}
+
+func distribuerDansLobby(lobby string, msg []byte) int {
+	echosDeHall.Lock()
+	cibles := make([]chan []byte, 0, len(echosDeHall.m))
+	for uid, c := range echosDeHall.m {
+		if echosDeHall.lobbies[uid] == lobby {
+			cibles = append(cibles, c)
+		}
+	}
+	echosDeHall.Unlock()
+	remis := 0
+	for _, c := range cibles {
+		select {
+		case c <- msg:
+			remis++
+		default:
+		}
+	}
+	return remis
 }
 
 // deposerSiPresent remet un message a un joueur SEULEMENT s'il ecoute deja.
@@ -133,49 +168,6 @@ func deposerSiPresent(uid string, msg []byte) bool {
 	default:
 		return false
 	}
-}
-
-// distribuerAuxAmis remet une publication de hall a son auteur ET a ses amis en ligne.
-//
-// C'est ce que le jeu attend d'une invitation de match — privee comme publique : elle s'affiche
-// dans les notifications de vos AMIS. Nous n'avions rien de tel. Le canal etait global, donc
-// l'annonce partait chez un joueur au hasard ; puis cloisonne par joueur, donc elle ne partait plus
-// nulle part. Ici on la distribue enfin a qui de droit.
-//
-// La liste d'amis vient du service de comptes, la meme que l'authentification interroge. L'appel
-// part dans sa propre routine : c'est un aller-retour HTTP, et la boucle qui lit les publications
-// ne doit pas l'attendre.
-func distribuerAuxAmis(uid string, msg []byte) {
-	if uid == "" {
-		return
-	}
-	// L'auteur recoit toujours son echo — c'est lui qui debloque son propre ecran de connexion.
-	deposerSiPresent(uid, msg)
-
-	go func() {
-		pid := pidPourUid(uid)
-		if pid == 0 {
-			log.Printf("[NPLN LOBBY] %s : pas de PID connu, publication non distribuee", short(uid))
-			return
-		}
-		acc, err := accountFriends(pid)
-		if err != nil {
-			log.Printf("[NPLN LOBBY] %s : liste d'amis indisponible (%v)", short(uid), err)
-			return
-		}
-		remis, total := 0, 0
-		for _, ami := range acc.Friends {
-			if ami.UserID == "" || ami.UserID == uid {
-				continue
-			}
-			total++
-			if deposerSiPresent(ami.UserID, msg) {
-				remis++
-			}
-		}
-		log.Printf("[NPLN LOBBY] %s : publication remise a %d ami(s) en ligne sur %d",
-			short(uid), remis, total)
-	}()
 }
 
 // hybrid codec: passes *rawMsg through untouched, everything else via protobuf.
@@ -209,6 +201,20 @@ func (hybridCodec) Unmarshal(data []byte, v any) error {
 func (hybridCodec) Name() string { return "proto" } // client speaks content-subtype "proto"
 
 func newHybridCodec() hybridCodec { return hybridCodec{} }
+
+func lobbyHeartbeatMessage() proto.Message {
+	if beat, ok := lobbyHeartbeatFrame(); ok {
+		response := &toyohrpb.RecvMessageResponse{}
+		if proto.Unmarshal(beat, response) == nil && response.GetKeepAlive() != nil {
+			return response
+		}
+	}
+	return &toyohrpb.RecvMessageResponse{
+		Payload: &toyohrpb.RecvMessageResponse_KeepAlive{
+			KeepAlive: &toyohrpb.KeepAlive{IdleTimeout: durationpb.New(3 * nplnStreamHeartbeat)},
+		},
+	}
+}
 
 // lobbyHeartbeatFrame returns the trailing heartbeat frame of the captured lobby stream
 // (the small frame Nintendo repeats after the cursor + message frames), if there is one.
@@ -419,6 +425,17 @@ func buildRecv(send, payload []byte, cursor string) []byte {
 		uid = uid[i+1:]
 	}
 	userpath := []byte("tenants/t-dce9377b-lp1/users/" + uid)
+	return buildRecvFromUserPath(userpath, payload, cursor)
+}
+
+func buildRecvFromUID(uid string, payload []byte, cursor string) []byte {
+	if uid == "" || len(payload) == 0 {
+		return nil
+	}
+	return buildRecvFromUserPath([]byte("tenants/t-dce9377b-lp1/users/"+uid), payload, cursor)
+}
+
+func buildRecvFromUserPath(userpath, payload []byte, cursor string) []byte {
 	inner := pbField(1, payload)
 	inner = append(inner, pbField(2, userpath)...)
 	// The {"v","t"} envelope is the toyohr STREAM CURSOR; messages older than the last-seen
@@ -531,16 +548,12 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		}
 	}
 
-	// LobbyMessaging pub/sub. SendMessage: log + fan S3's published bytes into lobbyEcho.
-	// RecvMessage: replay the captured context messages, then forward echoed publishes so S3
-	// receives its own NplnLogin (correct AppVer) and leaves the loading screen.
 	if strings.Contains(method, "LobbyMessaging/SendMessage") {
 		for {
 			var req rawMsg
 			if stream.RecvMsg(&req) != nil {
 				break
 			}
-			log.Printf("[NPLN LOBBY] SendMessage publish %d bytes: %x", len(req.b), req.b)
 			// [Nextendo] The toyohr stream cursor "t" MUST be a MILLISECOND epoch (13 digits), exactly
 			// like the real Nintendo server ({"v":1,"t":"1782647257080-0"}). We previously used
 			// UnixNano() -> a 19-digit value; S3's toyohr cursor parser reads "t" as milliseconds, so a
@@ -551,8 +564,7 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			if recv == nil {
 				continue
 			}
-			log.Printf("[NPLN LOBBY] reframed -> RecvMessage %d bytes: %x", len(recv), recv)
-			distribuerAuxAmis(uidFromCtx(stream.Context()), recv)
+			deposerSiPresent(uidFromCtx(stream.Context()), recv)
 		}
 		var ack []byte
 		if data, err := capturedBoot.ReadFile(methodToFile(method)); err == nil && len(data) >= 5 {
@@ -566,7 +578,7 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		// NOTE: we deliberately do NOT replay the stale captured RecvMessage messages — they
 		// carry an old stream cursor (~1782647257080) and a stale NplnLogin that poison the
 		// stream. We deliver only the live reframed NplnLogin echo (high cursor) below.
-		log.Printf("[NPLN LOBBY] RecvMessage: forwarding live SendMessage echoes only (no stale canned) + heartbeat %s", nplnStreamHeartbeat)
+		log.Printf("[NPLN LOBBY] RecvMessage: forwarding live messages + heartbeat %s", nplnStreamHeartbeat)
 		// [Nextendo] NOTE: sending the captured cursor-init frame here (lobbyCursorInitFrame) REGRESSED
 		// the flow — when S3 opened RecvMessage before its SendMessage, receiving the init frame made it
 		// skip announcing its own NplnLogin, so we never got a SendMessage to echo and it stalled even
@@ -575,11 +587,17 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		// The captured lobby stream also ends with a small heartbeat frame that Nintendo keeps
 		// repeating. Between echoes we used to send nothing at all, so S3 timed out and
 		// re-subscribed roughly every minute — the same flap as the other streams.
-		beat, hasBeat := lobbyHeartbeatFrame()
+		beat := lobbyHeartbeatMessage()
 		ticker := time.NewTicker(nplnStreamHeartbeat)
 		defer ticker.Stop()
 		moi := uidFromCtx(stream.Context())
-		mien := canalDeHall(moi)
+		var subscription rawMsg
+		if err := stream.RecvMsg(&subscription); err != nil {
+			return nil
+		}
+		lobby := string(pbWalk(subscription.b)[2])
+		mien := enregistrerAbonnementLobby(moi, lobby)
+		log.Printf("[NPLN LOBBY] RecvMessage uid=%s subscribed lobby=%q", short(moi), short(lobby))
 		defer oublierCanalDeHall(moi)
 		for {
 			select {
@@ -589,15 +607,29 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 					return err
 				}
 			case <-ticker.C:
-				if hasBeat {
-					if err := stream.SendMsg(&rawMsg{b: beat}); err != nil {
-						return nil
-					}
+				if err := stream.SendMsg(beat); err != nil {
+					return err
 				}
 			case <-stream.Context().Done():
 				return nil
 			}
 		}
+	}
+	if strings.Contains(method, "LobbyMessaging/SendLobbyMessage") {
+		var req rawMsg
+		if err := stream.RecvMsg(&req); err != nil {
+			return err
+		}
+		fields := pbWalk(req.b)
+		lobby := string(fields[2])
+		body := fields[3]
+		msg := buildRecvFromUID(uidFromCtx(stream.Context()), body, fmt.Sprintf("%d", time.Now().UnixMilli()))
+		remis := 0
+		if lobby != "" && msg != nil {
+			remis = distribuerDansLobby(lobby, msg)
+		}
+		log.Printf("[NPLN LOBBY] SendLobbyMessage lobby=%q body=%d octets -> %d abonnement(s)", short(lobby), len(body), remis)
+		return stream.SendMsg(&rawMsg{b: []byte{}})
 	}
 
 	// [Nextendo] GameRecord/InitializeAttributes creates a user's game-record attributes and, per
@@ -694,7 +726,7 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			// VS: build the reply from the captured VsUserAttribute document -- its field 2 is the
 			// very attribute map the game expects back (season_id, udemae, every x_power_*, the
 			// battle history...), and field 1 is the document name to announce.
-			vsDoc := alignCapturedIdentity(rawVsUserAttribute)
+			vsDoc := alignerCompteVierge(rawVsUserAttribute, liveReplayUID(stream))
 			parts := pbWalk(vsDoc)
 
 			resp = pbField(2, parts[1])
@@ -775,7 +807,11 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 		}
 
 		delta := req.GetSaveRecord().GetSaveData()
-		ts := recordStore.apply(uid, delta)
+		ts, err := recordStore.apply(uid, delta)
+		if err != nil {
+			log.Printf("[NPLN CloudSave] WriteSaveRecord uid=%s: persistence failed: %v", uid, err)
+			return status.Error(codes.Internal, "cloud save could not be persisted")
+		}
 		log.Printf("[NPLN CloudSave] WriteSaveRecord uid=%s jeton recu=%s", uid, jeton)
 		log.Printf("[NPLN CloudSave] WriteSaveRecord uid=%s evt=%s cles=%v -> fusionne, update_time=%s",
 			uid, strings.TrimPrefix(req.GetSaveEventType(), "tenants/current/saveEventTypes/"),
@@ -881,7 +917,11 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			}
 			return nil
 		}
-		rec := recordStore.snapshot(uid) // copie : marshaler le pointeur vivant course avec WriteSaveRecord
+		rec, err := recordStore.snapshotForLogin(uid) // copie, puis releve des minima au chargement du compte
+		if err != nil {
+			log.Printf("[NPLN CloudSave] GetSaveRecord uid=%s: read failed: %v", uid, err)
+			return status.Error(codes.Internal, "cloud save could not be read")
+		}
 		log.Printf("[NPLN CloudSave] GetSaveRecord uid=%s -> %d cles, update_time=%s",
 			uid, len(rec.GetSaveData().GetFields()), rec.GetUpdateTime().AsTime().Format(time.RFC3339Nano))
 		return stream.SendMsg(rec)
@@ -904,7 +944,11 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			log.Printf("[NPLN CloudSave] CreateSaveRecord uid=%s: illisible: %v", uid, err)
 			return status.Error(codes.InvalidArgument, "bad save record")
 		}
-		rec := recordStore.create(uid, req.GetSaveRecord())
+		rec, err := recordStore.create(uid, req.GetSaveRecord())
+		if err != nil {
+			log.Printf("[NPLN CloudSave] CreateSaveRecord uid=%s: persistence failed: %v", uid, err)
+			return status.Error(codes.Internal, "cloud save could not be persisted")
+		}
 		log.Printf("[NPLN CloudSave] CreateSaveRecord uid=%s -> %d cles enregistrees", uid, len(rec.GetSaveData().GetFields()))
 		return stream.SendMsg(rec)
 	}
@@ -941,7 +985,11 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 			})
 		}
 
-		rec := recordStore.setString(uid, "UserName", req.GetUserName())
+		rec, err := recordStore.setString(uid, "UserName", req.GetUserName())
+		if err != nil {
+			log.Printf("[NPLN CloudSave] ChangeUserName uid=%s: persistence failed: %v", uid, err)
+			return status.Error(codes.Internal, "cloud save could not be persisted")
+		}
 		log.Printf("[NPLN CloudSave] ChangeUserName uid=%s -> %q", uid, req.GetUserName())
 
 		return stream.SendMsg(&toyohrpb.ChangeUserNameResponse{
@@ -1037,8 +1085,12 @@ func replayHandler(srv any, stream grpc.ServerStream) error {
 
 	data, err := capturedBoot.ReadFile(methodToFile(method))
 	if err != nil {
-		// no captured response (e.g. UserScreening/GetViolation = empty) -> send one
-		// empty message + OK so the unary caller gets a valid (empty) reply.
+		if isServerStreamingMethod(method) {
+			log.Printf("[NPLN replay] %s -> no capture, holding server stream OPEN", method)
+			<-stream.Context().Done()
+			return nil
+		}
+
 		log.Printf("[NPLN replay] %s -> empty OK (no capture)", method)
 		return stream.SendMsg(&rawMsg{b: []byte{}})
 	}
@@ -1265,8 +1317,9 @@ func savePath(uid string) string {
 	return filepath.Join(saveDir(), safe+".save")
 }
 
-// saveOwner resolves whose save this is. Falls back to the capture identity so a session whose uid
-// metadata is missing still gets a stable slot instead of scribbling over a shared one.
+// saveOwner returns the account service's canonical UID for a verified signed
+// caller. The NPLN uid metadata is client-controlled and must never select a
+// cloud-save file. Missing identity or an account lookup failure fails closed.
 func saveOwner(ctx context.Context) string {
 	// L'identite du proprietaire vient du JETON VERIFIE, pas de ce que le client declare.
 	//
@@ -1337,7 +1390,7 @@ func (s *cloudSaveStore) get(uid string) ([]byte, bool) {
 // jamais.
 func alignerCompteVierge(capture []byte, uid string) []byte {
 	out := append([]byte(nil), capture...)
-	if uid == "" || uid == captureVierge {
+	if uid == "" {
 		return out
 	}
 	if len(uid) != len(captureVierge) {
@@ -1346,5 +1399,10 @@ func alignerCompteVierge(capture []byte, uid string) []byte {
 		log.Printf("[NPLN GameRecord] uid %q de longueur inattendue, capture laissee telle quelle", uid)
 		return out
 	}
-	return bytes.ReplaceAll(out, []byte(captureVierge), []byte(uid))
+	return motifUid.ReplaceAllFunc(out, func(found []byte) []byte {
+		if len(found) == len(uid) {
+			return []byte(uid)
+		}
+		return found
+	})
 }

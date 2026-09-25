@@ -10,10 +10,13 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // dashCtxKey carries the caller identity resolved once at TagRPC time, so the per-message
@@ -74,7 +77,7 @@ func noterConnexionDuJoueur(ctx context.Context, uid string) {
 	// Impossible jusqu'ici de savoir QUI rouvre : toutes les connexions arrivent par 10.0.1.7,
 	// l'adresse du proxy Docker, et le port source n'etait rattache a aucun joueur. On le note ici,
 	// au seul endroit ou la connexion et le joueur se rencontrent.
-	log.Printf("[stats] connexion #%d pour %s — %d ouverte(s) maintenant, %d depuis le demarrage",
+	debugLogf("[stats] connexion #%d pour %s — %d ouverte(s) maintenant, %d depuis le demarrage",
 		c.id, short(uid), suiviConnexions.ouvertes[uid], suiviConnexions.cumul[uid])
 }
 
@@ -109,8 +112,29 @@ type cleMethode struct{}
 // secondes et affiche « erreur de communication » — on veut donc voir venir bien avant.
 const seuilRPCLent = 2 * time.Second
 
+type rpcTraceKey struct{}
+
+type rpcTrace struct {
+	id            uint64
+	requests      atomic.Int64
+	responses     atomic.Int64
+	requestBytes  atomic.Int64
+	responseBytes atomic.Int64
+}
+
+var rpcTraceSequence atomic.Uint64
+
+func traceConnectionID(ctx context.Context) uint64 {
+	if c, ok := ctx.Value(cleConnexion{}).(*connexion); ok {
+		return c.id
+	}
+	return 0
+}
+
 func (connTracer) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	log.Printf("[stats] RPC begin method=%s", info.FullMethodName)
+	trace := &rpcTrace{id: rpcTraceSequence.Add(1)}
+	ctx = context.WithValue(ctx, rpcTraceKey{}, trace)
+	debugLogf("[stats] RPC arrival conn=%d rpc=%d method=%s", traceConnectionID(ctx), trace.id, info.FullMethodName)
 	ctx = context.WithValue(ctx, cleMethode{}, info.FullMethodName)
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		uid, pid, ip := dashIdentityAndIP(md, "")
@@ -122,9 +146,36 @@ func (connTracer) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Co
 }
 
 func (connTracer) HandleRPC(ctx context.Context, s stats.RPCStats) {
+	method, _ := ctx.Value(cleMethode{}).(string)
+	trace, _ := ctx.Value(rpcTraceKey{}).(*rpcTrace)
+	if trace != nil {
+		switch v := s.(type) {
+		case *stats.Begin:
+			debugLogf("[stats] RPC start conn=%d rpc=%d method=%s client_stream=%t server_stream=%t", traceConnectionID(ctx), trace.id, method, v.IsClientStream, v.IsServerStream)
+		case *stats.InPayload:
+			trace.requests.Add(1)
+			trace.requestBytes.Add(int64(v.Length))
+			debugLogf("[stats] RPC request conn=%d rpc=%d method=%s bytes=%d wire_bytes=%d", traceConnectionID(ctx), trace.id, method, v.Length, v.WireLength)
+			if req, ok := v.Payload.(interface{ GetCurrentTime() *timestamppb.Timestamp }); ok {
+				ts := req.GetCurrentTime()
+				if ts != nil && ts.CheckValid() == nil {
+					now := time.Now().UTC()
+					debugLogf("[NPLN clock] rpc=%d method=%s client_time=%s server_time=%s client_minus_server=%s", trace.id, method, ts.AsTime().Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), ts.AsTime().Sub(now))
+				} else {
+					debugLogf("[NPLN clock] rpc=%d method=%s current_time_missing_or_invalid", trace.id, method)
+				}
+			}
+		case *stats.OutPayload:
+			trace.responses.Add(1)
+			trace.responseBytes.Add(int64(v.Length))
+			debugLogf("[stats] RPC response conn=%d rpc=%d method=%s bytes=%d wire_bytes=%d", traceConnectionID(ctx), trace.id, method, v.Length, v.WireLength)
+		case *stats.End:
+			debugLogf("[stats] RPC finish conn=%d rpc=%d method=%s status=%s requests=%d request_bytes=%d responses=%d response_bytes=%d duration=%s context_err=%v context_cause=%v error=%v", traceConnectionID(ctx), trace.id, method, status.Code(v.Error), trace.requests.Load(), trace.requestBytes.Load(), trace.responses.Load(), trace.responseBytes.Load(), v.EndTime.Sub(v.BeginTime), ctx.Err(), context.Cause(ctx), v.Error)
+		}
+	}
 	switch v := s.(type) {
 	case *stats.InHeader:
-		log.Printf("[stats] RPC InHeader method=%s remote=%v", v.FullMethod, v.RemoteAddr)
+		debugLogf("[stats] RPC InHeader method=%s remote=%v", v.FullMethod, v.RemoteAddr)
 		// Single accounting point for the monitoring dashboard: InHeader carries the request
 		// metadata directly, so it sees EVERY call — the typed services, the replay handler and
 		// the long-lived streams alike — without touching any handler.
@@ -146,7 +197,7 @@ func (connTracer) HandleRPC(ctx context.Context, s stats.RPCStats) {
 	case *stats.End:
 		methode, _ := ctx.Value(cleMethode{}).(string)
 		duree := v.EndTime.Sub(v.BeginTime)
-		log.Printf("[stats] RPC End method=%s duree=%s err=%v", methode, duree.Round(time.Millisecond), v.Error)
+		debugLogf("[stats] RPC End method=%s duree=%s err=%v", methode, duree.Round(time.Millisecond), v.Error)
 		// Les flux vivent toute la session : leur duree ne dit rien. Ce qu'on traque, ce sont les
 		// appels ordinaires qui trainent, parce que c'est ce qui fait renoncer le jeu.
 		if duree >= seuilRPCLent && !fluxLong(methode) {
@@ -161,20 +212,21 @@ func (connTracer) HandleRPC(ctx context.Context, s stats.RPCStats) {
 }
 
 func (connTracer) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
-	log.Printf("[stats] CONN tag remote=%v local=%v", info.RemoteAddr, info.LocalAddr)
+
 	suiviConnexions.Lock()
 	suiviConnexions.seq++
 	id := suiviConnexions.seq
 	suiviConnexions.Unlock()
+	debugLogf("[stats] CONN tag conn=%d remote=%v local=%v", id, info.RemoteAddr, info.LocalAddr)
 	return context.WithValue(ctx, cleConnexion{}, &connexion{id: id})
 }
 
 func (connTracer) HandleConn(ctx context.Context, s stats.ConnStats) {
 	switch s.(type) {
 	case *stats.ConnBegin:
-		log.Printf("[stats] CONN begin (h2 established) — S3 reached the gRPC layer")
+		debugLogf("[stats] CONN begin conn=%d (h2 established)", traceConnectionID(ctx))
 	case *stats.ConnEnd:
-		log.Printf("[stats] CONN end")
+		debugLogf("[stats] CONN end conn=%d context_err=%v context_cause=%v", traceConnectionID(ctx), ctx.Err(), context.Cause(ctx))
 		if uid := fermerConnexion(ctx); uid != "" {
 			dashJoueurParti(uid)
 		}

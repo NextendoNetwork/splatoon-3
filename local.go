@@ -92,7 +92,7 @@ func startLocalCombined(addr, certFile, keyFile string) {
 			proto := tc.ConnectionState().NegotiatedProtocol
 			log.Printf("[NPLN LOCAL] conn de %s SNI=%q ALPN=%q", tc.RemoteAddr(), tc.ConnectionState().ServerName, proto)
 			if proto == "h2" {
-				grpcLn.push(c)
+				grpcLn.push(traceHTTP2Connection(c))
 			} else {
 				restLn.push(c)
 			}

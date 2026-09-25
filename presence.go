@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -341,119 +342,75 @@ func trimPresenceSuffix(name string) string {
 	return name
 }
 
-// KeepAlive is the client's presence heartbeat: it pings on an open bidi stream and expects one
-// ack per ping. The generic replay path deadlocks here (it drains every request before replying),
-// so this stays an explicit per-ping ack. Each ping also tells us the player is alive, which is
-// what makes their own presence ONLINE for everyone else.
-// ⚠️ LA REPONSE EST L'HORLOGE. Ne PAS repondre du tac au tac.
-//
-// MESURE DU 2026-08-13 (compteur de trames HTTP/2 sur le flux dechiffre, frames_diag.go) : avec un
-// ack par ping, le flux 1 — celui-ci — portait 1 362 DATA recues et 1 362 emises en QUINZE secondes,
-// soit 90 allers-retours par seconde, plus 1 378 PING et 4 062 WINDOW_UPDATE de consequence. Pendant
-// ce temps le serveur ne recevait plus AUCUN appel applicatif et le jeu finissait par afficher
-// « Une erreur de communication est survenue ».
-//
-// Le client renvoie son ping des qu'il recoit notre reponse : c'est donc NOUS qui cadençons. La
-// preuve que ce n'est pas son rythme naturel est dans la capture Nintendo — sur le compte vierge,
-// PresenceService/KeepAlive rend ONZE reponses de 10 octets en 293 s, soit une toutes les 29,3 s,
-// exactement l'intervalle que le Heartbeat annonce lui-meme ({30 s de ping, 50 s d'echeance}).
-//
-// Detail revelateur : le probleme a EMPIRE quand le transport a ete accelere (tic de re-verification
-// du sondage Bsd passe de 50 ms a 1 ms). La boucle est passee de 19,8 a 90 Hz — elle tourne a la
-// vitesse du transport. L'acceleration ne l'avait pas creee, elle la nourrissait.
-//
-// On draine donc les pings du client (chacun prouve qu'il est vivant, c'est ce qui le rend ONLINE
-// pour les autres) et on repond sur NOTRE cadence, celle de la capture.
 func (p *presenceServer) KeepAlive(stream friendspb.PresenceService_KeepAliveServer) error {
 	ctx := stream.Context()
 	uid := uidFromCtx(ctx)
-
-	// ⚠️ NE PAS ECRIRE « pid, _ := callerPID(ctx) » ICI. Ce flux arrive avec l'uid mais pas
-	// toujours avec un jeton exploitable : l'erreur jetee donnait pid=0, et le joueur s'affichait
-	// « # 0 » dans le suivi pendant toute sa session, sans pseudo ni photo. On passe donc par le
-	// recours uid -> PID etabli a l'authentification (voir pidDeLAppelant).
 	pid := pidDeLAppelant(ctx)
 	if pid == 0 && uid != "" {
 		log.Printf("[NPLN Presence] KeepAlive de %s SANS identite : ni jeton exploitable, ni appariement connu", uid)
 	}
+	return servePresenceHeartbeat(ctx, presenceKeepAliveInterval, func() error {
+		req := &friendspb.KeepAliveRequest{}
+		if err := stream.RecvMsg(req); err != nil {
+			return err
+		}
+		if uid != "" {
+			dashTouch(uid, pid, "")
+		}
+		if up := req.GetUpdatePresence(); up != nil && uid != "" {
+			attrs := up.GetPresence().GetAttributes()
+			retenirAttributsPresence(uid, attrs)
+			log.Printf("[NPLN Presence] UpdatePresence de %s : %d attribut(s) — GameStatus=%v SessionId=%q Current=%v Max=%v",
+				uid, len(attrs),
+				attrs["GameStatus"].GetIntegerValue(),
+				attrs["SessionId"].GetStringValue(),
+				attrs["CurrentParticipants"].GetIntegerValue(),
+				attrs["MaxParticipants"].GetIntegerValue())
 
-	// [Nextendo 2026-08-25] ACQUITTER CHAQUE PING, et pas seulement battre sur notre horloge.
-	//
-	// Mesure sur la capture Nintendo (locataire-001 a 003, port 443) : la console envoie 128, 34 et
-	// 77 pings, et le serveur y repond une fois pour une. Nous, nous les DRAINIONS sans repondre et
-	// nous envoyions un battement toutes les 30 s sur notre propre minuteur, sans rapport avec ses
-	// pings. Or la premiere reponse annonce le contrat {30 s, 50 s} : le client cale son delai
-	// dessus et attend une reponse A SON ping. Mesure du 25/08 : nos flux KeepAlive mouraient a
-	// 59,998 s / 1m0,001 s — le client abandonnait pile apres deux intervalles sans reponse, et le
-	// jeu affichait « une erreur de communication est survenue » alors que rien n'etait coupe.
-	//
-	// Un flux gRPC n'accepte pas deux Send concurrents : le draineur et le minuteur passent donc
-	// tous les deux par envoyer().
-	var envoiMu sync.Mutex
-	envoyer := func() bool {
-		envoiMu.Lock()
-		defer envoiMu.Unlock()
+			if inv := inventaireDesAttributs(attrs); attributsOntChange(uid, inv) {
+				log.Printf("[NPLN Presence] %s publie : %s", uid, inv)
+			}
+		}
+		return nil
+	}, func() error {
+		return stream.Send(&friendspb.KeepAliveResponse{Heartbeat: presenceHeartbeat()})
+	})
+}
 
-		return stream.Send(&friendspb.KeepAliveResponse{Heartbeat: presenceHeartbeat()}) == nil
+func servePresenceHeartbeat(ctx context.Context, interval time.Duration, receive func() error, send func() error) error {
+	if err := send(); err != nil {
+		return err
 	}
-
-	// Draineur : consomme les pings, Y REPOND, note la presence, et RETIENT les attributs pousses.
+	finished := make(chan error, 1)
 	go func() {
 		for {
-			req := &friendspb.KeepAliveRequest{}
-			if err := stream.RecvMsg(req); err != nil {
+			if err := receive(); err != nil {
+				finished <- err
 				return
 			}
-			if !envoyer() {
+			if err := ctx.Err(); err != nil {
+				finished <- err
 				return
-			}
-			if uid != "" {
-				dashTouch(uid, pid, "")
-			}
-			// Le joueur PUBLIE ici son etat : pseudo, mode, et surtout GameStatus + SessionId.
-			// Nous le jetions. C'est pour cela que la liste d'amis n'affichait que des points
-			// d'interrogation et jamais « Rejoindre » : le jeu recevait une presence sans le moindre
-			// attribut, alors que sa propre requete SubscribePresences les demande explicitement
-			// (« name », « state », « unsubscribed », « attributes »).
-			if up := req.GetUpdatePresence(); up != nil && uid != "" {
-				attrs := up.GetPresence().GetAttributes()
-				retenirAttributsPresence(uid, attrs)
-				// Journaliser CE QUI ARRIVE. Sans cette ligne, l'absence de trace ne distinguait pas
-				// « le client ne pousse rien » de « nous ne journalisons pas » — j'ai conclu a tort
-				// le premier alors que rien ne le mesurait.
-				log.Printf("[NPLN Presence] UpdatePresence de %s : %d attribut(s) — GameStatus=%v SessionId=%q Current=%v Max=%v",
-					uid, len(attrs),
-					attrs["GameStatus"].GetIntegerValue(),
-					attrs["SessionId"].GetStringValue(),
-					attrs["CurrentParticipants"].GetIntegerValue(),
-					attrs["MaxParticipants"].GetIntegerValue())
-
-				// L'INVENTAIRE COMPLET, une fois par changement. La ligne ci-dessus n'imprime que
-				// quatre attributs choisis a la main sur les treize envoyes : les neuf autres
-				// disparaissaient sans trace, dont FestTeam. Voir presence_attributs.go.
-				if inv := inventaireDesAttributs(attrs); attributsOntChange(uid, inv) {
-					log.Printf("[NPLN Presence] %s publie : %s", uid, inv)
-				}
 			}
 		}
 	}()
-
-	// Premiere reponse tout de suite : c'est elle qui porte le contrat {30 s, 50 s} et sur laquelle
-	// le client cale son minuteur. Les suivantes suivent l'intervalle annonce.
-	if !envoyer() {
-		return nil
-	}
-
-	t := time.NewTicker(presenceKeepAliveInterval)
-	defer t.Stop()
-
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-t.C:
-			if !envoyer() {
+			return ctx.Err()
+		case err := <-finished:
+			if err == io.EOF {
 				return nil
+			}
+			return err
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := send(); err != nil {
+				return err
 			}
 		}
 	}

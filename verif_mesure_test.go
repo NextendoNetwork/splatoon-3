@@ -30,6 +30,16 @@ func TestMesureDeFeteRejoueLaCapture(t *testing.T) {
 	if !strings.HasPrefix(m.GetDocument(), "tenants/") || !strings.Contains(m.GetDocument(), "/documents/") {
 		t.Fatalf("le document doit respecter la grammaire du SDK : %q", m.GetDocument())
 	}
+	if !strings.Contains(m.GetDocument(), "/users/u-exemple1000000000000/") {
+		t.Fatalf("document belongs to another user: %q", m.GetDocument())
+	}
+	if got := m.GetFields().GetFields()["npln_user_id"].GetStringValue(); got != "u-exemple1000000000000" {
+		t.Fatalf("measurement user = %q", got)
+	}
+	doc, ok := storeGetDocument(m.GetDocument())
+	if !ok || !proto.Equal(doc.GetFields(), m.GetFields()) {
+		t.Fatal("created measurement document is not readable with the returned fields")
+	}
 	t.Logf("name     = %s", m.GetName())
 	t.Logf("document = %s", m.GetDocument())
 	t.Logf("champs   = %d", len(m.GetFields().GetFields()))
